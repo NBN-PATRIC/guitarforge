@@ -1,0 +1,68 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod analysis;
+mod audio;
+mod dsp;
+mod gui;
+mod meters;
+mod paths;
+mod preset;
+mod settings;
+
+fn init_log() {
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("guitarforge=info,warn"));
+    // sem console na versão release: o log vai para %APPDATA%\GuitarForge\guitarforge.log
+    if !cfg!(debug_assertions) {
+        if let Ok(file) = std::fs::File::create(paths::log_file()) {
+            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+    }
+    builder.init();
+    std::panic::set_hook(Box::new(|info| log::error!("pânico: {info}")));
+}
+
+fn main() -> anyhow::Result<()> {
+    init_log();
+    log::info!("GuitarForge v{}", env!("CARGO_PKG_VERSION"));
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--dispositivos") {
+        println!("{}", audio::describe());
+        return Ok(());
+    }
+    if let Some(i) = args.iter().position(|a| a == "--ruido") {
+        let usage = || anyhow::anyhow!("uso: --ruido arquivo.wav inicio_s fim_s");
+        let path = args.get(i + 1).ok_or_else(usage)?;
+        let start: f32 = args.get(i + 2).and_then(|v| v.parse().ok()).ok_or_else(usage)?;
+        let end: f32 = args.get(i + 3).and_then(|v| v.parse().ok()).ok_or_else(usage)?;
+        let [(rp, rr), (fp, fr)] = analysis::noise_report(std::path::Path::new(path), start, end)?;
+        println!("cru: pico {rp:.1} dBFS, RMS {rr:.1} | sem 60 Hz: pico {fp:.1} dBFS, RMS {fr:.1}");
+        return Ok(());
+    }
+    if let Some(i) = args.iter().position(|a| a == "--espectro") {
+        let usage = || anyhow::anyhow!("uso: --espectro arquivo.wav inicio_s fim_s");
+        let path = args.get(i + 1).ok_or_else(usage)?;
+        let start: f32 = args.get(i + 2).and_then(|v| v.parse().ok()).ok_or_else(usage)?;
+        let end: f32 = args.get(i + 3).and_then(|v| v.parse().ok()).ok_or_else(usage)?;
+        let peaks = analysis::spectrum_peaks(std::path::Path::new(path), start, end)?;
+        let text: Vec<String> = peaks.iter().map(|(f, db)| format!("{f:.1} Hz ({db:+.0} dB)")).collect();
+        println!("{start:.2}-{end:.2} s: {}", text.join(", "));
+        return Ok(());
+    }
+    if let Some(i) = args.iter().position(|a| a == "--analisar") {
+        let path = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("uso: --analisar arquivo.wav [fmin] [Hz da corda escolhida]"))?;
+        let fmin = args.get(i + 2).and_then(|v| v.parse().ok()).unwrap_or(60.0);
+        let target = args.get(i + 3).and_then(|v| v.parse().ok());
+        for (t, hz, level) in analysis::analyze_file(std::path::Path::new(path), fmin, target)? {
+            match hz {
+                Some(f) => {
+                    let n = dsp::tuner::note_for(f);
+                    println!("{t:7.2} s  {level:6.1} dBFS  {f:8.2} Hz  {}{} {:+.0}", dsp::tuner::Notation::Letters.name(n.index), n.octave, n.cents);
+                }
+                None => println!("{t:7.2} s  {level:6.1} dBFS  --"),
+            }
+        }
+        return Ok(());
+    }
+    gui::run()
+}
