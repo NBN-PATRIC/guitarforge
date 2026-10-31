@@ -13,7 +13,10 @@ pub struct NoiseGate {
     release: f32,
     hold: usize,
     hold_left: usize,
+    /// Ganho com o gate fechado (0 = mudo).
+    floor: f32,
     pub open: bool,
+    sr: f32,
 }
 
 impl NoiseGate {
@@ -28,10 +31,18 @@ impl NoiseGate {
             release: time_coef(80.0, sr),
             hold: (0.05 * sr) as usize,
             hold_left: 0,
+            floor: 0.0,
             open: false,
+            sr,
         };
         g.set_threshold_db(-52.0);
         g
+    }
+
+    pub fn set_times(&mut self, hold_ms: f32, release_ms: f32, range_db: f32) {
+        self.hold = (hold_ms.max(0.0) * 0.001 * self.sr) as usize;
+        self.release = time_coef(release_ms.max(1.0), self.sr);
+        self.floor = if range_db >= 90.0 { 0.0 } else { db_to_lin(-range_db) };
     }
 
     pub fn set_threshold_db(&mut self, db: f32) {
@@ -55,7 +66,7 @@ impl NoiseGate {
                     self.open = false;
                 }
             }
-            let target = if self.open { 1.0 } else { 0.0 };
+            let target = if self.open { 1.0 } else { self.floor };
             let coef = if target > self.gain { self.attack } else { self.release };
             self.gain = target + (self.gain - target) * coef;
             *s *= self.gain;
@@ -70,6 +81,23 @@ mod tests {
 
     fn tone(amp: f32, n: usize) -> Vec<f32> {
         (0..n).map(|i| amp * (2.0 * PI * 60.0 * i as f32 / 48000.0).sin()).collect()
+    }
+
+    #[test]
+    fn hold_keeps_a_fading_note_until_the_time_runs_out() {
+        let mut g = NoiseGate::new(48000.0);
+        g.set_threshold_db(-52.0);
+        g.set_times(500.0, 80.0, 90.0);
+        let mut note = tone(db_to_lin(-20.0), 24000);
+        g.process(&mut note);
+        assert!(g.open);
+        // a nota cai para baixo do limiar: 300 ms depois ainda aberto, 700 ms depois fechado
+        let mut tail = tone(db_to_lin(-70.0), 14400);
+        g.process(&mut tail);
+        assert!(g.open, "fechou antes da espera");
+        let mut more = tone(db_to_lin(-70.0), 19200);
+        g.process(&mut more);
+        assert!(!g.open, "não fechou depois da espera");
     }
 
     #[test]

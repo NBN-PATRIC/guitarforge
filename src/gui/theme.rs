@@ -24,6 +24,12 @@ pub const CAB: Color32 = Color32::from_rgb(0xd6, 0xa8, 0x72);
 pub const EQ: Color32 = Color32::from_rgb(0xc9, 0xe2, 0x65);
 pub const DELAY: Color32 = Color32::from_rgb(0xa9, 0x8b, 0xff);
 pub const REVERB: Color32 = Color32::from_rgb(0x44, 0xc4, 0xa1);
+pub const WAH: Color32 = Color32::from_rgb(0xf5, 0xd0, 0x3b);
+pub const OCTAVE: Color32 = Color32::from_rgb(0x7f, 0x8c, 0xff);
+pub const BOOST: Color32 = Color32::from_rgb(0xff, 0x5f, 0x7e);
+pub const PHASER: Color32 = Color32::from_rgb(0xff, 0x8f, 0xc8);
+pub const FLANGER: Color32 = Color32::from_rgb(0xd9, 0x9b, 0xff);
+pub const TREMOLO: Color32 = Color32::from_rgb(0x9b, 0xe3, 0x7a);
 
 /// Tema escuro fixo. As cores ficam todas aqui para a fase "personalizável".
 pub fn apply(ctx: &Context) {

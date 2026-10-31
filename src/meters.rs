@@ -38,7 +38,18 @@ pub struct Meters {
     pub in_block: AtomicU32,
     pub out_block: AtomicU32,
     pub ring_fill: AtomicU32,
+    /// Amostras enfileiradas no dispositivo de saída no modo exclusivo (0 no compartilhado).
+    pub out_queue: AtomicU32,
     pub underruns: AtomicU32,
+    /// Amostras jogadas fora pela saída porque o anel encheu demais (estalo que não conta como falha).
+    pub ring_drops: AtomicU32,
+    /// Amostras pedidas pela saida exclusiva desde a abertura (o dispositivo tem de pedir a taxa dele por segundo).
+    pub out_frames: std::sync::atomic::AtomicU64,
+    /// Taxa (amostras/s) que a saída exclusiva pediu quando errou e passou para o compartilhado; 0 = não passou.
+    pub out_fallback: AtomicU32,
+    /// Maior intervalo entre dois blocos de entrada e maior tempo de processamento de um bloco (µs).
+    pub in_gap_max_us: AtomicU32,
+    pub proc_max_us: AtomicU32,
     pub device_error: AtomicBool,
     pub recording: AtomicBool,
     pub rec_dropped: AtomicU32,
@@ -63,7 +74,13 @@ impl Meters {
             in_block: AtomicU32::new(0),
             out_block: AtomicU32::new(0),
             ring_fill: AtomicU32::new(0),
+            out_queue: AtomicU32::new(0),
             underruns: AtomicU32::new(0),
+            ring_drops: AtomicU32::new(0),
+            out_frames: std::sync::atomic::AtomicU64::new(0),
+            out_fallback: AtomicU32::new(0),
+            in_gap_max_us: AtomicU32::new(0),
+            proc_max_us: AtomicU32::new(0),
             device_error: AtomicBool::new(false),
             recording: AtomicBool::new(false),
             rec_dropped: AtomicU32::new(0),
@@ -78,6 +95,10 @@ impl Meters {
 
     pub fn reset_engine_counters(&self) {
         self.underruns.store(0, Relaxed);
+        self.ring_drops.store(0, Relaxed);
+        self.out_fallback.store(0, Relaxed);
+        self.in_gap_max_us.store(0, Relaxed);
+        self.proc_max_us.store(0, Relaxed);
         self.device_error.store(false, Relaxed);
         self.ring_fill.store(0, Relaxed);
         self.pitch_hz.set(0.0);

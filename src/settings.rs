@@ -71,12 +71,18 @@ pub struct GateCfg {
     pub hum_filter: bool,
     /// Limiar ajustado sozinho pelo ruído de fundo medido (o `threshold_db` só vale com isso desligado).
     pub auto: bool,
+    /// Quanto o gate espera aberto depois que a nota cai abaixo do limiar (nota longa não é cortada no meio).
+    pub hold_ms: f32,
+    /// Tempo para fechar depois que a nota some.
+    pub release_ms: f32,
+    /// Quanto o gate abaixa quando fecha (90 dB = mudo).
+    pub range_db: f32,
 }
 
 impl Default for GateCfg {
     fn default() -> Self {
         // medido no cabo: zumbido parado entre -60 e -67 dBFS, conforme a mão e a chave
-        Self { on: true, threshold_db: -52.0, hum_filter: true, auto: true }
+        Self { on: true, threshold_db: -52.0, hum_filter: true, auto: true, hold_ms: 50.0, release_ms: 80.0, range_db: 90.0 }
     }
 }
 
@@ -167,12 +173,116 @@ impl Default for CabCfg {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EqCfg {
     pub on: bool,
     pub bands_db: [f32; 5],
+    /// Corte de graves (passa-altas de 12 dB/oitava); 20 Hz = desligado.
+    pub low_cut_hz: f32,
+    /// Corte de agudos (passa-baixas de 12 dB/oitava); 20 kHz = desligado.
+    pub high_cut_hz: f32,
 }
+
+impl Default for EqCfg {
+    fn default() -> Self {
+        Self { on: false, bands_db: [0.0; 5], low_cut_hz: 20.0, high_cut_hz: 20000.0 }
+    }
+}
+
+/// Auto-wah: a palhetada abre o filtro.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WahCfg {
+    pub on: bool,
+    pub sens: f32,
+    pub resonance: f32,
+    pub range: f32,
+}
+
+impl Default for WahCfg {
+    fn default() -> Self {
+        Self { on: false, sens: 0.5, resonance: 0.5, range: 0.6 }
+    }
+}
+
+/// Oitavador: oitava abaixo, oitava acima e o som direto.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OctaveCfg {
+    pub on: bool,
+    pub sub: f32,
+    pub up: f32,
+    pub dry: f32,
+}
+
+impl Default for OctaveCfg {
+    fn default() -> Self {
+        Self { on: false, sub: 0.6, up: 0.0, dry: 0.7 }
+    }
+}
+
+/// Boost limpo (dB) com brilho.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BoostCfg {
+    pub on: bool,
+    pub level_db: f32,
+    pub bright: f32,
+}
+
+impl Default for BoostCfg {
+    fn default() -> Self {
+        Self { on: false, level_db: 6.0, bright: 0.3 }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhaserCfg {
+    pub on: bool,
+    pub rate: f32,
+    pub depth: f32,
+    pub feedback: f32,
+}
+
+impl Default for PhaserCfg {
+    fn default() -> Self {
+        Self { on: false, rate: 0.3, depth: 0.7, feedback: 0.4 }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlangerCfg {
+    pub on: bool,
+    pub rate: f32,
+    pub depth: f32,
+    pub feedback: f32,
+}
+
+impl Default for FlangerCfg {
+    fn default() -> Self {
+        Self { on: false, rate: 0.2, depth: 0.6, feedback: 0.5 }
+    }
+}
+
+/// Tremolo: `shape` vai da senoide (0) ao quase quadrado (1).
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TremoloCfg {
+    pub on: bool,
+    pub rate: f32,
+    pub depth: f32,
+    pub shape: f32,
+}
+
+impl Default for TremoloCfg {
+    fn default() -> Self {
+        Self { on: false, rate: 0.4, depth: 0.5, shape: 0.0 }
+    }
+}
+
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -211,8 +321,14 @@ pub struct Settings {
     pub mute: bool,
     pub gate: GateCfg,
     pub comp: CompCfg,
+    pub wah: WahCfg,
+    pub octave: OctaveCfg,
+    pub boost: BoostCfg,
     pub drive: DriveCfg,
     pub chorus: ChorusCfg,
+    pub phaser: PhaserCfg,
+    pub flanger: FlangerCfg,
+    pub tremolo: TremoloCfg,
     pub amp: AmpCfg,
     pub cab: CabCfg,
     pub eq: EqCfg,
@@ -228,8 +344,14 @@ impl Default for Settings {
             mute: false,
             gate: GateCfg::default(),
             comp: CompCfg::default(),
+            wah: WahCfg::default(),
+            octave: OctaveCfg::default(),
+            boost: BoostCfg::default(),
             drive: DriveCfg::default(),
             chorus: ChorusCfg::default(),
+            phaser: PhaserCfg::default(),
+            flanger: FlangerCfg::default(),
+            tremolo: TremoloCfg::default(),
             amp: AmpCfg::default(),
             cab: CabCfg::default(),
             eq: EqCfg::default(),

@@ -131,8 +131,59 @@ pub fn factory() -> Vec<Preset> {
             s.reverb.size = 0.85;
             s.reverb.mix = 0.4;
         }),
+        make("Funk com wah", |s| {
+            s.amp.gain = 0.35;
+            s.amp.treble = 0.6;
+            s.comp.on = true;
+            s.comp.sustain = 0.5;
+            s.wah.on = true;
+            s.wah.sens = 0.6;
+            s.wah.resonance = 0.6;
+            s.reverb.size = 0.3;
+            s.reverb.mix = 0.12;
+        }),
+        make("Surf com tremolo", |s| {
+            s.amp.gain = 0.4;
+            s.amp.treble = 0.65;
+            s.cab.kind = CabKind::Open2x12;
+            s.tremolo.on = true;
+            s.tremolo.rate = 0.45;
+            s.tremolo.depth = 0.6;
+            s.tremolo.shape = 0.2;
+            s.reverb.size = 0.7;
+            s.reverb.mix = 0.35;
+        }),
+        make("Psicodélico", |s| {
+            s.amp.channel = AmpChannel::Crunch;
+            s.amp.gain = 0.4;
+            s.octave.on = true;
+            s.octave.sub = 0.0;
+            s.octave.up = 0.7;
+            s.octave.dry = 0.6;
+            s.drive.on = true;
+            s.drive.kind = DriveKind::Fuzz;
+            s.drive.gain = 0.6;
+            s.phaser.on = true;
+            s.phaser.rate = 0.25;
+            s.reverb.size = 0.4;
+            s.reverb.mix = 0.2;
+        }),
+        make("Rock com boost", |s| {
+            s.amp.channel = AmpChannel::Lead;
+            s.amp.gain = 0.45;
+            s.amp.bass = 0.55;
+            s.amp.presence = 0.55;
+            s.boost.on = true;
+            s.boost.level_db = 8.0;
+            s.boost.bright = 0.4;
+            s.cab.kind = CabKind::Closed4x12;
+            s.eq.on = true;
+            s.eq.low_cut_hz = 90.0;
+            s.eq.high_cut_hz = 7000.0;
+            s.reverb.size = 0.3;
+            s.reverb.mix = 0.12;
+        }),
         make("Direto (só o cabo)", |s| {
-            s.gate.on = false;
             s.amp.on = false;
             s.cab.on = false;
             s.reverb.on = false;
@@ -220,6 +271,60 @@ impl LatencyMode {
             Self::Safe => 2.0,
         }
     }
+
+    /// Período pedido ao dispositivo no modo exclusivo; o driver sobe até o mínimo dele (3 ms no cabo).
+    pub fn exclusive_period_ms(self) -> f64 {
+        match self {
+            Self::Low | Self::Normal => 3.0,
+            Self::Safe => 10.0,
+        }
+    }
+}
+
+/// Sobreamostragem do drive e do amp: tira o chiado metálico da distorção forte (aliasing).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Oversample {
+    Off,
+    X2,
+    /// Tudo ligado a 4x gasta 2,7% de um núcleo (1,0% sem): o padrão pode ser o melhor.
+    #[default]
+    X4,
+}
+
+impl Oversample {
+    pub const ALL: [Oversample; 3] = [Self::Off, Self::X2, Self::X4];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Desligada",
+            Self::X2 => "2x",
+            Self::X4 => "4x",
+        }
+    }
+
+    pub fn factor(self) -> usize {
+        match self {
+            Self::Off => 1,
+            Self::X2 => 2,
+            Self::X4 => 4,
+        }
+    }
+}
+
+/// Modo exclusivo por lado: o app fica dono do dispositivo e o atraso cai, mas outros programas
+/// perdem aquele dispositivo enquanto o GuitarForge estiver aberto.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Exclusive {
+    pub input: bool,
+    pub output: bool,
+}
+
+impl Default for Exclusive {
+    fn default() -> Self {
+        // o cabo só serve ao GuitarForge; a saída é o fone de todo o resto do Windows
+        Self { input: true, output: false }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,6 +334,8 @@ pub struct AppState {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub latency: LatencyMode,
+    pub exclusive: Exclusive,
+    pub oversample: Oversample,
     pub tuning: String,
     pub notation: Notation,
 }
@@ -240,6 +347,8 @@ impl Default for AppState {
             input_device: None,
             output_device: None,
             latency: LatencyMode::Normal,
+            exclusive: Exclusive::default(),
+            oversample: Oversample::default(),
             tuning: Tuning::default().id(),
             notation: Notation::Solfege,
         }

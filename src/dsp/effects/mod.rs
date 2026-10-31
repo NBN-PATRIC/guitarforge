@@ -1,13 +1,25 @@
+mod boost;
 mod chorus;
 mod compressor;
 mod delay;
 mod drive;
 mod eq;
+mod flanger;
+mod octave;
+mod phaser;
 mod reverb;
+mod tremolo;
+mod wah;
 
+pub use boost::Boost;
 pub use chorus::Chorus;
 pub use compressor::Compressor;
 pub use delay::Delay;
 pub use drive::Drive;
 pub use eq::ParametricEq;
+pub use flanger::Flanger;
+pub use octave::Octave;
+pub use phaser::Phaser;
 pub use reverb::Reverb;
+pub use tremolo::Tremolo;
+pub use wah::Wah;

@@ -5,6 +5,7 @@ pub mod effects;
 pub mod hum_filter;
 pub mod hum_meter;
 pub mod noise_gate;
+pub mod oversample;
 pub mod tuner;
 
 use crate::settings::Settings;
@@ -40,7 +41,8 @@ impl Smoothed {
     }
 }
 
-/// Cadeia fixa: entrada > filtro de 60 Hz > gate > comp > drive > chorus > amp > gabinete > EQ > delay > reverb > volume.
+/// Cadeia fixa: entrada > filtro de 60 Hz > gate > comp > wah > oitava > boost > drive > chorus > phaser > flanger >
+/// tremolo > amp > gabinete > EQ > delay > reverb > volume.
 pub struct SignalChain {
     input_gain: Smoothed,
     master: Smoothed,
@@ -56,12 +58,26 @@ pub struct SignalChain {
     gate: noise_gate::NoiseGate,
     comp_on: bool,
     comp: effects::Compressor,
+    wah_on: bool,
+    wah: effects::Wah,
+    octave_on: bool,
+    octave: effects::Octave,
+    boost_on: bool,
+    boost: effects::Boost,
     drive_on: bool,
     drive: effects::Drive,
+    drive_os: oversample::Oversampler,
     chorus_on: bool,
     chorus: effects::Chorus,
+    phaser_on: bool,
+    phaser: effects::Phaser,
+    flanger_on: bool,
+    flanger: effects::Flanger,
+    tremolo_on: bool,
+    tremolo: effects::Tremolo,
     amp_on: bool,
     amp: amp::AmpSim,
+    amp_os: oversample::Oversampler,
     cab_on: bool,
     pub cabinet: cabinet::CabinetSim,
     eq_on: bool,
@@ -73,7 +89,9 @@ pub struct SignalChain {
 }
 
 impl SignalChain {
-    pub fn new(sr: f32, settings: &Settings) -> Self {
+    /// `oversample`: 1, 2 ou 4; o drive e o amp rodam nessa taxa multiplicada.
+    pub fn new(sr: f32, settings: &Settings, oversample: usize) -> Self {
+        let hi = sr * oversample.max(1) as f32;
         let mut chain = Self {
             input_gain: Smoothed::new(1.0, sr),
             master: Smoothed::new(0.0, sr),
@@ -88,12 +106,26 @@ impl SignalChain {
             gate: noise_gate::NoiseGate::new(sr),
             comp_on: false,
             comp: effects::Compressor::new(sr),
+            wah_on: false,
+            wah: effects::Wah::new(sr),
+            octave_on: false,
+            octave: effects::Octave::new(sr),
+            boost_on: false,
+            boost: effects::Boost::new(sr),
             drive_on: false,
-            drive: effects::Drive::new(sr),
+            drive: effects::Drive::new(hi),
+            drive_os: oversample::Oversampler::new(oversample),
             chorus_on: false,
             chorus: effects::Chorus::new(sr),
+            phaser_on: false,
+            phaser: effects::Phaser::new(sr),
+            flanger_on: false,
+            flanger: effects::Flanger::new(sr),
+            tremolo_on: false,
+            tremolo: effects::Tremolo::new(sr),
             amp_on: false,
-            amp: amp::AmpSim::new(sr),
+            amp: amp::AmpSim::new(hi),
+            amp_os: oversample::Oversampler::new(oversample),
             cab_on: false,
             cabinet: cabinet::CabinetSim::new(sr),
             eq_on: false,
@@ -115,11 +147,24 @@ impl SignalChain {
         self.gate_on = s.gate.on;
         self.auto_gate = s.gate.auto;
         self.manual_threshold_db = s.gate.threshold_db;
+        self.gate.set_times(s.gate.hold_ms, s.gate.release_ms, s.gate.range_db);
         if !self.auto_gate {
             self.gate.set_threshold_db(s.gate.threshold_db);
         }
         self.comp_on = s.comp.on;
         self.comp.set(s.comp.sustain, s.comp.level);
+        if s.wah.on && !self.wah_on {
+            self.wah.clear();
+        }
+        self.wah_on = s.wah.on;
+        self.wah.set(s.wah.sens, s.wah.resonance, s.wah.range);
+        if s.octave.on && !self.octave_on {
+            self.octave.clear();
+        }
+        self.octave_on = s.octave.on;
+        self.octave.set(s.octave.sub, s.octave.up, s.octave.dry);
+        self.boost_on = s.boost.on;
+        self.boost.set(s.boost.level_db, s.boost.bright);
         self.drive_on = s.drive.on;
         self.drive.set(&s.drive);
 
@@ -128,13 +173,25 @@ impl SignalChain {
         }
         self.chorus_on = s.chorus.on;
         self.chorus.set(s.chorus.rate, s.chorus.depth, s.chorus.mix);
+        if s.phaser.on && !self.phaser_on {
+            self.phaser.clear();
+        }
+        self.phaser_on = s.phaser.on;
+        self.phaser.set(s.phaser.rate, s.phaser.depth, s.phaser.feedback);
+        if s.flanger.on && !self.flanger_on {
+            self.flanger.clear();
+        }
+        self.flanger_on = s.flanger.on;
+        self.flanger.set(s.flanger.rate, s.flanger.depth, s.flanger.feedback);
+        self.tremolo_on = s.tremolo.on;
+        self.tremolo.set(s.tremolo.rate, s.tremolo.depth, s.tremolo.shape);
 
         self.amp_on = s.amp.on;
         self.amp.set(&s.amp);
         self.cab_on = s.cab.on;
         self.cabinet.set(&s.cab);
         self.eq_on = s.eq.on;
-        self.eq.set(&s.eq.bands_db);
+        self.eq.set(&s.eq.bands_db, s.eq.low_cut_hz, s.eq.high_cut_hz);
 
         self.delay.set(s.delay.time_ms, s.delay.feedback, s.delay.mix);
         if s.delay.on && !self.delay_on {
@@ -182,14 +239,34 @@ impl SignalChain {
         if self.comp_on {
             self.comp.process(buf);
         }
+        if self.wah_on {
+            self.wah.process(buf);
+        }
+        if self.octave_on {
+            self.octave.process(buf);
+        }
+        if self.boost_on {
+            self.boost.process(buf);
+        }
         if self.drive_on {
-            self.drive.process(buf);
+            let drive = &mut self.drive;
+            self.drive_os.process(buf, |hi| drive.process(hi));
         }
         if self.chorus_on {
             self.chorus.process(buf);
         }
+        if self.phaser_on {
+            self.phaser.process(buf);
+        }
+        if self.flanger_on {
+            self.flanger.process(buf);
+        }
+        if self.tremolo_on {
+            self.tremolo.process(buf);
+        }
         if self.amp_on {
-            self.amp.process(buf);
+            let amp = &mut self.amp;
+            self.amp_os.process(buf, |hi| amp.process(hi));
         }
         if self.cab_on {
             self.cabinet.process(buf);
@@ -221,6 +298,89 @@ mod tests {
     use super::*;
     use crate::settings::{AmpChannel, DriveKind};
 
+    /// Nota de guitarra sintética: Lá da 5ª corda com harmônicos, ataque e decaimento.
+    fn pluck(sr: f32, seconds: f32) -> Vec<f32> {
+        (0..(sr * seconds) as usize)
+            .map(|i| {
+                let t = i as f32 / sr;
+                let env = (-t * 2.5).exp();
+                (1..8).map(|h| 0.25 / h as f32 * (2.0 * std::f32::consts::PI * 110.0 * h as f32 * t).sin()).sum::<f32>() * env
+            })
+            .collect()
+    }
+
+    /// Correlação normalizada máxima entre `a` atrasado de 0 a 120 amostras e `b`.
+    fn best_correlation(a: &[f32], b: &[f32]) -> f32 {
+        (0..120)
+            .map(|lag| {
+                let (x, y) = (&a[lag..], &b[..b.len() - lag]);
+                let dot: f32 = x.iter().zip(y).map(|(p, q)| p * q).sum();
+                let nx: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let ny: f32 = y.iter().map(|v| v * v).sum::<f32>().sqrt();
+                dot / (nx * ny + 1e-12)
+            })
+            .fold(f32::MIN, f32::max)
+    }
+
+    /// Caso real de 31/10: com a sobreamostragem ligada o som ficava incompreensível no cabo.
+    #[test]
+    fn oversampling_keeps_the_same_sound() {
+        let sr = 48000.0;
+        for channel in AmpChannel::ALL {
+            let mut s = Settings::default();
+            s.amp.channel = channel;
+            s.drive.on = channel != AmpChannel::Clean;
+            s.reverb.on = false;
+            s.gate.on = false;
+            let render = |factor: usize| {
+                let mut chain = SignalChain::new(sr, &s, factor);
+                let mut buf = pluck(sr, 1.0);
+                for block in buf.chunks_mut(144) {
+                    chain.process(block);
+                }
+                buf
+            };
+            let (plain, over) = (render(1), render(4));
+            let c = best_correlation(&over[4800..], &plain[4800..]);
+            println!("{channel:?}: correlação {c:.4}");
+            assert!(c > 0.9, "{channel:?}: correlação {c:.3} entre 1x e 4x");
+        }
+    }
+
+    /// Custo da cadeia com tudo ligado, em fração de tempo real (`cargo test --release -- --ignored --nocapture custo`).
+    #[test]
+    #[ignore]
+    fn custo_da_cadeia_inteira() {
+        let sr = 48000.0;
+        let mut s = Settings::default();
+        s.comp.on = true;
+        s.wah.on = true;
+        s.octave.on = true;
+        s.boost.on = true;
+        s.drive.on = true;
+        s.chorus.on = true;
+        s.phaser.on = true;
+        s.flanger.on = true;
+        s.tremolo.on = true;
+        s.amp.channel = AmpChannel::Lead;
+        s.eq.on = true;
+        s.delay.on = true;
+        for factor in [1, 2, 4] {
+            let mut chain = SignalChain::new(sr, &s, factor);
+            let mut buf = vec![0.0f32; 144];
+            let seconds = 20.0;
+            let start = std::time::Instant::now();
+            for b in 0..(seconds * sr / 144.0) as usize {
+                for (i, v) in buf.iter_mut().enumerate() {
+                    *v = 0.3 * (2.0 * std::f32::consts::PI * 110.0 * (b * 144 + i) as f32 / sr).sin();
+                }
+                chain.process(&mut buf);
+            }
+            let used = start.elapsed().as_secs_f32() / seconds;
+            println!("{factor}x: {:.2}% de um núcleo", used * 100.0);
+        }
+    }
+
     #[test]
     fn everything_on_stays_finite_and_bounded() {
         let sr = 48000.0;
@@ -234,6 +394,17 @@ mod tests {
                 s.drive.kind = kind;
                 s.drive.gain = 1.0;
                 s.chorus.on = true;
+                s.wah = crate::settings::WahCfg { on: true, sens: 1.0, resonance: 1.0, range: 1.0 };
+                s.octave = crate::settings::OctaveCfg { on: true, sub: 1.0, up: 1.0, dry: 1.0 };
+                s.boost = crate::settings::BoostCfg { on: true, level_db: 20.0, bright: 1.0 };
+                s.phaser = crate::settings::PhaserCfg { on: true, rate: 1.0, depth: 1.0, feedback: 1.0 };
+                s.flanger = crate::settings::FlangerCfg { on: true, rate: 1.0, depth: 1.0, feedback: 1.0 };
+                s.tremolo = crate::settings::TremoloCfg { on: true, rate: 1.0, depth: 1.0, shape: 1.0 };
+                s.gate.release_ms = 10.0;
+                s.gate.hold_ms = 0.0;
+                s.gate.range_db = 10.0;
+                s.eq.low_cut_hz = 400.0;
+                s.eq.high_cut_hz = 2000.0;
                 s.amp.channel = channel;
                 s.amp.gain = 1.0;
                 s.amp.bass = 1.0;
@@ -246,7 +417,7 @@ mod tests {
                 s.reverb.on = true;
                 s.reverb.size = 1.0;
                 s.reverb.mix = 1.0;
-                let mut chain = SignalChain::new(sr, &s);
+                let mut chain = SignalChain::new(sr, &s, 4);
                 let mut x = 1u32;
                 for _ in 0..200 {
                     let mut buf: Vec<f32> = (0..480)
@@ -272,7 +443,7 @@ mod tests {
         s.amp.on = false;
         s.cab.on = false;
         s.reverb.on = false;
-        let mut chain = SignalChain::new(sr, &s);
+        let mut chain = SignalChain::new(sr, &s, 4);
         let mut seed = 7u32;
         let mut hiss = move || {
             seed ^= seed << 13;
@@ -316,7 +487,7 @@ mod tests {
     fn mute_silences_the_output() {
         let mut s = Settings::default();
         s.mute = true;
-        let mut chain = SignalChain::new(48000.0, &s);
+        let mut chain = SignalChain::new(48000.0, &s, 2);
         let mut buf = vec![0.5f32; 4800];
         chain.process(&mut buf);
         assert!(buf[2400..].iter().all(|v| v.abs() < 1e-3));

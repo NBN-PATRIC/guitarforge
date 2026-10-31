@@ -30,6 +30,58 @@ fn main() -> anyhow::Result<()> {
         println!("{}", audio::describe());
         return Ok(());
     }
+    if let Some(i) = args.iter().position(|a| a == "--print") {
+        // --print arquivo.bmp [largura altura] [fim]
+        let path = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("uso: --print arquivo.bmp [largura altura]"))?;
+        let w = args.get(i + 2).and_then(|v| v.parse().ok()).unwrap_or(1220.0);
+        let h = args.get(i + 3).and_then(|v| v.parse().ok()).unwrap_or(860.0);
+        let bottom = args.get(i + 4).is_some_and(|v| v == "fim");
+        return gui::print(path.into(), [w, h], bottom);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--diagnostico") {
+        // --diagnostico segundos [entrada|saida|ambos|nenhum] [baixa|normal|segura] [1|2|4] pasta
+        let seconds = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(20);
+        let which = args.get(i + 2).map(String::as_str).unwrap_or("ambos");
+        let exclusive = preset::Exclusive {
+            input: matches!(which, "entrada" | "ambos"),
+            output: matches!(which, "saida" | "ambos"),
+        };
+        let latency = match args.get(i + 3).map(String::as_str) {
+            Some("baixa") => preset::LatencyMode::Low,
+            Some("segura") => preset::LatencyMode::Safe,
+            _ => preset::LatencyMode::Normal,
+        };
+        let oversample = match args.get(i + 4).map(String::as_str) {
+            Some("2") => preset::Oversample::X2,
+            Some("4") => preset::Oversample::X4,
+            _ => preset::Oversample::Off,
+        };
+        let dir = args.get(i + 5).map(std::path::PathBuf::from).unwrap_or_else(|| "diagnostico".into());
+        print!("{}", audio::diagnostic::run(seconds, exclusive, latency, oversample, &dir)?);
+        return Ok(());
+    }
+    if let Some(i) = args.iter().position(|a| a == "--teste-motor") {
+        // --teste-motor [segundos] [entrada|saida|ambos|nenhum] [baixa|normal|segura] [nome da saída]
+        let seconds = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(10);
+        let which = args.get(i + 2).map(String::as_str).unwrap_or("ambos");
+        let exclusive = preset::Exclusive {
+            input: matches!(which, "entrada" | "ambos"),
+            output: matches!(which, "saida" | "ambos"),
+        };
+        let latency = match args.get(i + 3).map(String::as_str) {
+            Some("baixa") => preset::LatencyMode::Low,
+            Some("segura") => preset::LatencyMode::Safe,
+            _ => preset::LatencyMode::Normal,
+        };
+        let output = args.get(i + 4).map(String::as_str);
+        print!("{}", audio::engine_test(seconds, exclusive, latency, output)?);
+        return Ok(());
+    }
+    #[cfg(windows)]
+    if args.iter().any(|a| a == "--wasapi") {
+        println!("{}", audio::wasapi_io::describe());
+        return Ok(());
+    }
     if let Some(i) = args.iter().position(|a| a == "--ruido") {
         let usage = || anyhow::anyhow!("uso: --ruido arquivo.wav inicio_s fim_s");
         let path = args.get(i + 1).ok_or_else(usage)?;

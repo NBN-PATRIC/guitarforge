@@ -102,6 +102,12 @@ impl Biquad {
         self.a2 = other.a2;
     }
 
+    /// Zera a memória do filtro (pedal religado não solta o resto do som antigo).
+    pub fn reset(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
+
     #[inline]
     pub fn tick(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;

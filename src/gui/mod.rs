@@ -18,7 +18,7 @@ use crate::dsp::lin_to_db;
 use crate::dsp::tuner::{self, Instrument, Tuning};
 use crate::meters::Meters;
 use crate::paths;
-use crate::preset::{self, AppState, LatencyMode, Preset};
+use crate::preset::{self, AppState, Exclusive, LatencyMode, Oversample, Preset};
 use crate::settings::{AmpChannel, CabKind, DriveKind, EQ_FREQS, Settings};
 use widgets::{KNOB_W, Knob, fmt_db, fmt_ms};
 
@@ -45,10 +45,56 @@ pub fn run() -> anyhow::Result<()> {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            Ok(Box::new(App::new(true)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// `--print`: abre a janela sem áudio, deixa assentar, grava o que o próprio app desenhou num BMP e fecha.
+/// Serve para conferir o layout sem capturar a tela (que pegaria as janelas de outros programas).
+pub fn print(path: PathBuf, size: [f32; 2], bottom: bool) -> anyhow::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_title("GuitarForge (print)").with_inner_size(size),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "GuitarForge print",
+        options,
+        Box::new(move |cc| {
+            theme::apply(&cc.egui_ctx);
+            let mut app = App::new(false);
+            app.print = Some((path, 0));
+            app.print_bottom = bottom;
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn save_bmp(path: &std::path::Path, image: &egui::ColorImage) -> std::io::Result<()> {
+    let [w, h] = image.size;
+    let row = (w * 3).div_ceil(4) * 4;
+    let size = 54 + row * h;
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(size as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]);
+    for y in (0..h).rev() {
+        let start = out.len();
+        for p in &image.pixels[y * w..(y + 1) * w] {
+            out.extend_from_slice(&[p.b(), p.g(), p.r()]);
+        }
+        out.resize(start + row, 0);
+    }
+    std::fs::write(path, out)
 }
 
 struct TuningEditor {
@@ -62,6 +108,8 @@ struct AudioDialog {
     input: Option<String>,
     output: Option<String>,
     latency: LatencyMode,
+    exclusive: Exclusive,
+    oversample: Oversample,
 }
 
 enum CabAction {
@@ -107,10 +155,13 @@ struct App {
     needle: f32,
     dirty: bool,
     last_save: Instant,
+    /// `--print`: destino e quadros desenhados até agora.
+    print: Option<(PathBuf, u32)>,
+    print_bottom: bool,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(audio: bool) -> Self {
         let state = AppState::load();
         let now = Instant::now();
         let mut app = Self {
@@ -150,12 +201,16 @@ impl App {
             needle: 0.0,
             dirty: false,
             last_save: now,
+            print: None,
+            print_bottom: false,
         };
         if let Some(path) = app.state.preset.ir_path.clone() {
             app.load_ir(PathBuf::from(path), false);
         }
         app.reset_strings();
-        app.start_engine();
+        if audio {
+            app.start_engine();
+        }
         app
     }
 
@@ -176,6 +231,8 @@ impl App {
             self.state.input_device.as_deref(),
             self.state.output_device.as_deref(),
             self.state.latency,
+            self.state.exclusive,
+            self.state.oversample,
             &settings,
             self.meters.clone(),
         ) {
@@ -239,6 +296,8 @@ impl App {
         p.settings.master = current.master;
         p.settings.mute = current.mute;
         p.settings.input_gain_db = current.input_gain_db;
+        // a supressão de ruído é do cabo e da guitarra, não do som: não muda com o preset
+        p.settings.gate = current.gate;
         self.baseline = p.settings;
         let ir_path = p.ir_path.clone();
         self.state.preset = p;
@@ -313,10 +372,21 @@ impl App {
             input: self.state.input_device.clone(),
             output: self.state.output_device.clone(),
             latency: self.state.latency,
+            exclusive: self.state.exclusive,
+            oversample: self.state.oversample,
         });
     }
 
     fn poll(&mut self) {
+        let fallback = self.meters.out_fallback.load(Relaxed);
+        if let Some(e) = self.engine.as_mut().filter(|e| fallback > 0 && e.info.exclusive.output) {
+            // a thread da saída já trocou sozinha para o compartilhado; aqui só fica registrado e visível
+            e.info.exclusive.output = false;
+            e.info.notice = Some(format!(
+                "o fone pediu {fallback} amostras/s em vez de {}, defeito dele no modo exclusivo",
+                e.info.out_rate
+            ));
+        }
         if self.engine.is_some() && self.meters.device_error.swap(false, Relaxed) {
             self.stop_recording();
             self.engine = None;
@@ -465,10 +535,36 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some((path, frames)) = &mut self.print {
+            *frames += 1;
+            ctx.request_repaint();
+            if *frames == 30 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            }
+            let shot = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(image) = shot {
+                if let Err(e) = save_bmp(path, &image) {
+                    log::error!("print: {e}");
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
         self.poll();
 
         if !ctx.wants_keyboard_input() {
-            let (mute, tune, rec) = ctx.input(|i| (i.key_pressed(Key::M), i.key_pressed(Key::T), i.key_pressed(Key::R)));
+            let (mute, tune, rec, noise) =
+                ctx.input(|i| (i.key_pressed(Key::M), i.key_pressed(Key::T), i.key_pressed(Key::R), i.key_pressed(Key::N)));
+            if noise {
+                let g = &mut self.state.preset.settings.gate;
+                let on = g.on || g.hum_filter;
+                g.on = !on;
+                g.hum_filter = !on;
+            }
             if mute {
                 self.state.preset.settings.mute = !self.state.preset.settings.mute;
             }
@@ -487,7 +583,11 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(Frame::none().fill(theme::PANEL).inner_margin(Margin::symmetric(0.0, 12.0)))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                if self.print_bottom && self.print.as_ref().is_some_and(|(_, f)| *f == 10) {
+                    scroll = scroll.vertical_scroll_offset(10_000.0);
+                }
+                scroll.show(ui, |ui| {
                     Frame::none().inner_margin(Margin::symmetric(side, 0.0)).show(ui, |ui| {
                         self.preset_rows(ui);
                         ui.add_space(12.0);
@@ -686,7 +786,7 @@ impl App {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("Knobs: arraste, ou clique e use as setas · M mudo · T afinador · R gravar").small().color(theme::FAINT));
+                        ui.label(RichText::new("Knobs: arraste, ou clique e use as setas · M mudo · T afinador · R gravar · N ruído").small().color(theme::FAINT));
                         ui.add_space(12.0);
                         if let Some(e) = &self.rec_error {
                             ui.label(RichText::new(truncate(e, 50)).small().color(theme::RED)).on_hover_text(e.clone());
@@ -731,9 +831,24 @@ impl App {
             if modified {
                 undo = ui.button("Desfazer").on_hover_text("Volta ao preset como estava").clicked();
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let g = &mut self.state.preset.settings.gate;
+                let on = g.on || g.hum_filter;
+                let text = if on { "Supressão de ruído: ligada" } else { "Supressão de ruído: desligada" };
+                let button = Button::new(RichText::new(text).color(if on { theme::GREEN } else { theme::DIM }))
+                    .fill(if on { theme::GREEN.gamma_multiply(0.12) } else { theme::CARD_OFF })
+                    .stroke(Stroke::new(1.0_f32, if on { theme::GREEN.gamma_multiply(0.7) } else { theme::FAINT }));
+                let hint = "Corta o chiado entre as notas (gate) e o zumbido da rede elétrica. Vale para todos os presets (tecla N). \
+                            Nota longa sendo cortada: aumente a Espera e o Fecha no cartão Entrada e Gate. \
+                            O WAV (DI) da gravação sai sempre sem corte.";
+                if ui.add(button).on_hover_text(hint).clicked() {
+                    g.on = !on;
+                    g.hum_filter = !on;
+                }
+            });
         });
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             row_label(ui, "CADEIA");
             chain_strip(ui, &mut self.state.preset.settings);
         });
@@ -746,6 +861,7 @@ impl App {
             self.state.preset.settings.master = keep.master;
             self.state.preset.settings.mute = keep.mute;
             self.state.preset.settings.input_gain_db = keep.input_gain_db;
+            self.state.preset.settings.gate = keep.gate;
         }
         if save {
             self.save_error = None;
@@ -1054,15 +1170,20 @@ impl App {
         let s = &mut self.state.preset.settings;
         let total = ui.available_width();
 
-        section_title(ui, "PEDAIS", "antes do amplificador");
-        let w = card_widths(total, &[200.0, 150.0, 230.0, 230.0]);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = GAP;
-            pedal_input(ui, s, w[0], gate_auto);
-            pedal_comp(ui, s, w[1]);
-            pedal_drive(ui, s, w[2]);
-            pedal_chorus(ui, s, w[3]);
-        });
+        section_title(ui, "PEDAIS", "antes do amplificador, na ordem do sinal");
+        for (i, row) in balanced_rows(total, &Pedal::ALL, Pedal::min_w).iter().enumerate() {
+            if i > 0 {
+                ui.add_space(GAP);
+            }
+            let mins: Vec<f32> = row.iter().map(|p| p.min_w()).collect();
+            let w = card_widths(total, &mins);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                for (&p, &w) in row.iter().zip(&w) {
+                    pedal(ui, p, s, w, gate_auto);
+                }
+            });
+        }
 
         ui.add_space(18.0);
         section_title(ui, "AMPLIFICADOR E GABINETE", "o coração do som");
@@ -1076,7 +1197,7 @@ impl App {
 
         ui.add_space(18.0);
         section_title(ui, "DEPOIS DO AMP", "equalizador, eco e ambiência");
-        let w = card_widths(total, &[230.0, 230.0, 150.0]);
+        let w = card_widths(total, &[400.0, 230.0, 150.0]);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
             eq_panel(ui, s, w[0]);
@@ -1176,23 +1297,62 @@ impl App {
                         }
                     });
                     ui.end_row();
+
+                    ui.label("Sobreamostragem");
+                    ui.horizontal(|ui| {
+                        for o in Oversample::ALL {
+                            ui.selectable_value(&mut d.oversample, o, o.label()).on_hover_text(
+                                "O drive e o amp rodam a 2x ou 4x a taxa do cabo: some o chiado metálico da distorção forte. \
+                                 Cada um soma uns 0,5 ms (2x) ou 0,7 ms (4x) de atraso e gasta mais processador.",
+                            );
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Modo exclusivo");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut d.exclusive.input, "Entrada").on_hover_text(
+                            "O GuitarForge fica dono do cabo e lê blocos de 3 ms em vez de 10 ms. Sem efeito colateral: o cabo só serve a ele.",
+                        );
+                        ui.checkbox(&mut d.exclusive.output, "Saída").on_hover_text(
+                            "Uns 10 ms a menos, mas enquanto o GuitarForge estiver aberto os outros programas ficam sem som nessa saída. \
+                             Fone sem fio USB pode não aguentar: o app confere a taxa logo depois de abrir e, se o fone errar, volta sozinho \
+                             para o compartilhado.",
+                        );
+                    });
+                    ui.end_row();
                 });
 
                 ui.add_space(6.0);
                 match &self.engine {
                     Some(e) => {
+                        let mode = |ex: bool| if ex { "exclusivo" } else { "compartilhado" };
+                        let windows = if e.info.exclusive.input && e.info.exclusive.output {
+                            "o driver soma só uns 2 ms"
+                        } else {
+                            "o Windows soma uns 10 a 20 ms no lado compartilhado"
+                        };
                         ui.label(
                             RichText::new(format!(
-                                "Em uso: {} ({}) → {} ({}). Atraso do app ~{:.0} ms; o Windows soma uns 10 a 20 ms.",
+                                "Em uso: {} ({}, {}) › {} ({}, {}). Atraso do app ~{:.0} ms; {windows}.",
                                 e.info.input,
                                 khz(e.info.rate),
+                                mode(e.info.exclusive.input),
                                 e.info.output,
                                 khz(e.info.out_rate),
+                                mode(e.info.exclusive.output),
                                 e.latency_ms(&self.meters)
                             ))
                             .small()
                             .color(theme::DIM),
                         );
+                        if let Some(n) = &e.info.notice {
+                            ui.label(
+                                RichText::new(format!("Exclusivo não abriu ({n}); esse lado ficou no compartilhado."))
+                                    .small()
+                                    .color(theme::YELLOW),
+                            );
+                        }
                     }
                     None => {
                         if let Some(err) = &self.engine_error {
@@ -1216,6 +1376,8 @@ impl App {
             self.state.input_device = d.input.clone();
             self.state.output_device = d.output.clone();
             self.state.latency = d.latency;
+            self.state.exclusive = d.exclusive;
+            self.state.oversample = d.oversample;
             self.dirty = true;
             self.start_engine();
         }
@@ -1236,6 +1398,7 @@ fn same_sound(a: &Settings, b: &Settings) -> bool {
     x.master = b.master;
     x.mute = b.mute;
     x.input_gain_db = b.input_gain_db;
+    x.gate = b.gate;
     x == *b
 }
 
@@ -1308,11 +1471,17 @@ fn chain_strip(ui: &mut Ui, s: &mut Settings) {
     };
     fixed(ui, "Cabo");
     let drive = drive_color(s.drive.kind);
-    let stages: [(&str, &mut bool, Color32); 9] = [
+    let stages: [(&str, &mut bool, Color32); 15] = [
         ("Gate", &mut s.gate.on, theme::GATE),
         ("Comp", &mut s.comp.on, theme::COMP),
+        ("Wah", &mut s.wah.on, theme::WAH),
+        ("Oitava", &mut s.octave.on, theme::OCTAVE),
+        ("Boost", &mut s.boost.on, theme::BOOST),
         ("Drive", &mut s.drive.on, drive),
         ("Chorus", &mut s.chorus.on, theme::CHORUS),
+        ("Phaser", &mut s.phaser.on, theme::PHASER),
+        ("Flanger", &mut s.flanger.on, theme::FLANGER),
+        ("Tremolo", &mut s.tremolo.on, theme::TREMOLO),
         ("Amp", &mut s.amp.on, theme::AMBER),
         ("Gabinete", &mut s.cab.on, theme::CAB),
         ("EQ", &mut s.eq.on, theme::EQ),
@@ -1341,6 +1510,82 @@ fn card_widths(total: f32, mins: &[f32]) -> Vec<f32> {
     let sum: f32 = mins.iter().sum();
     let scale = ((total - fixed) / sum).max(1.0);
     mins.iter().map(|m| (m * scale).floor()).collect()
+}
+
+/// Reparte os itens em fileiras de tamanho parecido, sem mudar a ordem, com o menor número de fileiras em que
+/// todas cabem na largura (cada cartão soma o recuo dos dois lados e o vão até o próximo).
+fn balanced_rows<T: Copy>(total: f32, items: &[T], min_w: impl Fn(T) -> f32) -> Vec<Vec<T>> {
+    let fits = |row: &[T]| {
+        let n = row.len() as f32;
+        row.iter().map(|&p| min_w(p)).sum::<f32>() + GAP * (n - 1.0) + 2.0 * CARD_PAD * n + 1.0 <= total
+    };
+    for rows in 1..=items.len() {
+        let (base, extra) = (items.len() / rows, items.len() % rows);
+        let mut out = Vec::with_capacity(rows);
+        let mut start = 0;
+        for r in 0..rows {
+            let n = base + usize::from(r < extra);
+            out.push(items[start..start + n].to_vec());
+            start += n;
+        }
+        if out.iter().all(|r| fits(r)) {
+            return out;
+        }
+    }
+    items.iter().map(|&p| vec![p]).collect()
+}
+
+/// Pedais antes do amplificador, na ordem do sinal.
+#[derive(Clone, Copy)]
+enum Pedal {
+    Input,
+    Comp,
+    Wah,
+    Octave,
+    Boost,
+    Drive,
+    Chorus,
+    Phaser,
+    Flanger,
+    Tremolo,
+}
+
+impl Pedal {
+    const ALL: [Pedal; 10] = [
+        Self::Input,
+        Self::Comp,
+        Self::Wah,
+        Self::Octave,
+        Self::Boost,
+        Self::Drive,
+        Self::Chorus,
+        Self::Phaser,
+        Self::Flanger,
+        Self::Tremolo,
+    ];
+
+    fn min_w(self) -> f32 {
+        match self {
+            Self::Input => 380.0,
+            Self::Comp | Self::Boost => 150.0,
+            _ => 230.0,
+        }
+    }
+}
+
+fn pedal(ui: &mut Ui, p: Pedal, s: &mut Settings, w: f32, gate_auto: Option<f32>) {
+    match p {
+        Pedal::Input => pedal_input(ui, s, w, gate_auto),
+        Pedal::Comp => pedal_comp(ui, s, w),
+        Pedal::Wah => pedal_wah(ui, s, w),
+        Pedal::Octave => pedal_octave(ui, s, w),
+        Pedal::Boost => pedal_boost(ui, s, w),
+        Pedal::Drive => pedal_drive(ui, s, w),
+        Pedal::Chorus => pedal_chorus(ui, s, w),
+        Pedal::Phaser => pedal_phaser(ui, s, w),
+        Pedal::Flanger => pedal_flanger(ui, s, w),
+        Pedal::Tremolo => pedal_tremolo(ui, s, w),
+    }
 }
 
 /// `n` itens de largura `item_w` espalhados por igual na largura disponível (folga limitada) e centralizados.
@@ -1398,7 +1643,7 @@ const PEDAL_BODY: f32 = 132.0;
 
 fn pedal_input(ui: &mut Ui, s: &mut Settings, w: f32, gate_auto: Option<f32>) {
     card(ui, "Entrada e Gate", "Ganho e corte de chiado", theme::GATE, &mut s.gate.on, w, PEDAL_BODY, |ui| {
-        even_row(ui, 2, KNOB_W, |ui| {
+        even_row(ui, 5, KNOB_W, |ui| {
             ui.add(Knob::new(&mut s.input_gain_db, "Nível").range(-12.0, 24.0, 0.0).step(0.5).bipolar().format(fmt_db).accent(theme::GATE))
                 .on_hover_text("Ganho do cabo antes de tudo. Vale para todos os presets.");
             if s.gate.auto {
@@ -1413,6 +1658,12 @@ fn pedal_input(ui: &mut Ui, s: &mut Settings, w: f32, gate_auto: Option<f32>) {
                 ui.add(Knob::new(&mut s.gate.threshold_db, "Limiar").range(-80.0, -20.0, -52.0).step(0.5).format(fmt_db).accent(theme::GATE))
                     .on_hover_text("Energia abaixo da qual o gate corta o som.");
             }
+            ui.add(Knob::new(&mut s.gate.hold_ms, "Espera").range(0.0, 2000.0, 50.0).step(10.0).format(fmt_ms).accent(theme::GATE))
+                .on_hover_text("Quanto o gate espera aberto depois que a nota fica fraca. Aumente se notas longas forem cortadas.");
+            ui.add(Knob::new(&mut s.gate.release_ms, "Fecha").range(10.0, 2000.0, 80.0).step(10.0).format(fmt_ms).accent(theme::GATE))
+                .on_hover_text("Quanto tempo o som leva para sumir quando o gate fecha. Mais longo = fim de nota natural.");
+            ui.add(Knob::new(&mut s.gate.range_db, "Redução").range(10.0, 90.0, 90.0).step(1.0).format(fmt_range).accent(theme::GATE))
+                .on_hover_text("Quanto o gate abaixa ao fechar. \"total\" = mudo; menos deixa um fundo e soa menos cortado.");
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -1462,6 +1713,81 @@ fn pedal_chorus(ui: &mut Ui, s: &mut Settings, w: f32) {
             ui.add(Knob::new(&mut s.chorus.rate, "Velocidade").accent(theme::CHORUS).default_value(0.3));
             ui.add(Knob::new(&mut s.chorus.depth, "Profund.").accent(theme::CHORUS));
             ui.add(Knob::new(&mut s.chorus.mix, "Mix").accent(theme::CHORUS));
+        });
+    });
+}
+
+fn pedal_wah(ui: &mut Ui, s: &mut Settings, w: f32) {
+    let c = &mut s.wah;
+    card(ui, "Auto-wah", "A palhetada abre o filtro", theme::WAH, &mut c.on, w, PEDAL_BODY, |ui| {
+        even_row(ui, 3, KNOB_W, |ui| {
+            ui.add(Knob::new(&mut c.sens, "Sensib.").accent(theme::WAH))
+                .on_hover_text("Quanto a força da palhetada abre o filtro. Alto: abre até tocando de leve.");
+            ui.add(Knob::new(&mut c.resonance, "Resson.").accent(theme::WAH))
+                .on_hover_text("Alto: estreito e cantado. Baixo: largo e suave.");
+            ui.add(Knob::new(&mut c.range, "Faixa").default_value(0.6).accent(theme::WAH))
+                .on_hover_text("Até onde o filtro abre, de 1 a 3,5 kHz.");
+        });
+    });
+}
+
+fn pedal_octave(ui: &mut Ui, s: &mut Settings, w: f32) {
+    let c = &mut s.octave;
+    card(ui, "Oitava", "Uma nota por vez", theme::OCTAVE, &mut c.on, w, PEDAL_BODY, |ui| {
+        even_row(ui, 3, KNOB_W, |ui| {
+            ui.add(Knob::new(&mut c.sub, "Abaixo").default_value(0.6).accent(theme::OCTAVE))
+                .on_hover_text("Uma oitava abaixo, como um baixo junto. Em acorde ele se perde (nos pedais também).");
+            ui.add(Knob::new(&mut c.up, "Acima").default_value(0.0).accent(theme::OCTAVE))
+                .on_hover_text("Uma oitava acima, áspero, de solo psicodélico. Soa melhor com o drive depois.");
+            ui.add(Knob::new(&mut c.dry, "Direto").default_value(0.7).accent(theme::OCTAVE)).on_hover_text("O som original.");
+        });
+    });
+}
+
+fn pedal_boost(ui: &mut Ui, s: &mut Settings, w: f32) {
+    let c = &mut s.boost;
+    card(ui, "Boost", "Empurra o drive e o amp", theme::BOOST, &mut c.on, w, PEDAL_BODY, |ui| {
+        even_row(ui, 2, KNOB_W, |ui| {
+            ui.add(Knob::new(&mut c.level_db, "Ganho").range(0.0, 20.0, 6.0).step(0.5).format(fmt_db).accent(theme::BOOST))
+                .on_hover_text("Volume a mais antes do drive e do amp: satura mais e destaca o solo.");
+            ui.add(Knob::new(&mut c.bright, "Brilho").default_value(0.3).accent(theme::BOOST))
+                .on_hover_text("Realça os agudos, como os treble boosters dos anos 60.");
+        });
+    });
+}
+
+fn pedal_phaser(ui: &mut Ui, s: &mut Settings, w: f32) {
+    let c = &mut s.phaser;
+    card(ui, "Phaser", "Redemoinho que sobe e desce", theme::PHASER, &mut c.on, w, PEDAL_BODY, |ui| {
+        even_row(ui, 3, KNOB_W, |ui| {
+            ui.add(Knob::new(&mut c.rate, "Velocidade").default_value(0.3).accent(theme::PHASER));
+            ui.add(Knob::new(&mut c.depth, "Profund.").default_value(0.7).accent(theme::PHASER));
+            ui.add(Knob::new(&mut c.feedback, "Realim.").default_value(0.4).accent(theme::PHASER))
+                .on_hover_text("Acentua o efeito, deixando o som mais vocal.");
+        });
+    });
+}
+
+fn pedal_flanger(ui: &mut Ui, s: &mut Settings, w: f32) {
+    let c = &mut s.flanger;
+    card(ui, "Flanger", "Jato que passa", theme::FLANGER, &mut c.on, w, PEDAL_BODY, |ui| {
+        even_row(ui, 3, KNOB_W, |ui| {
+            ui.add(Knob::new(&mut c.rate, "Velocidade").default_value(0.2).accent(theme::FLANGER));
+            ui.add(Knob::new(&mut c.depth, "Profund.").default_value(0.6).accent(theme::FLANGER));
+            ui.add(Knob::new(&mut c.feedback, "Realim.").default_value(0.5).accent(theme::FLANGER))
+                .on_hover_text("Alto: metálico, de avião. Baixo: suave, quase um chorus.");
+        });
+    });
+}
+
+fn pedal_tremolo(ui: &mut Ui, s: &mut Settings, w: f32) {
+    let c = &mut s.tremolo;
+    card(ui, "Tremolo", "Volume que pulsa", theme::TREMOLO, &mut c.on, w, PEDAL_BODY, |ui| {
+        even_row(ui, 3, KNOB_W, |ui| {
+            ui.add(Knob::new(&mut c.rate, "Velocidade").default_value(0.4).accent(theme::TREMOLO)).on_hover_text("De 1 a 12 pulsos por segundo.");
+            ui.add(Knob::new(&mut c.depth, "Profund.").accent(theme::TREMOLO));
+            ui.add(Knob::new(&mut c.shape, "Forma").default_value(0.0).accent(theme::TREMOLO))
+                .on_hover_text("Zero: onda suave, de amp antigo. No máximo: picotado, quase liga e desliga.");
         });
     });
 }
@@ -1536,11 +1862,22 @@ const FX_BODY: f32 = 122.0;
 
 fn eq_panel(ui: &mut Ui, s: &mut Settings, w: f32) {
     let e = &mut s.eq;
-    card(ui, "Equalizador", "5 faixas, ±12 dB", theme::EQ, &mut e.on, w, FX_BODY, |ui| {
-        even_row(ui, 5, widgets::FADER_W, |ui| {
-            for (band, freq) in e.bands_db.iter_mut().zip(EQ_FREQS) {
-                ui.add(widgets::Fader::new(band, 12.0, freq_label(freq), theme::EQ));
-            }
+    card(ui, "Equalizador", "5 faixas, ±12 dB, e cortes", theme::EQ, &mut e.on, w, FX_BODY, |ui| {
+        ui.columns(2, |cols| {
+            cols[0].spacing_mut().item_spacing.x = 4.0;
+            even_row(&mut cols[0], 5, widgets::FADER_W, |ui| {
+                for (band, freq) in e.bands_db.iter_mut().zip(EQ_FREQS) {
+                    ui.add(widgets::Fader::new(band, 12.0, freq_label(freq), theme::EQ));
+                }
+            });
+            even_row(&mut cols[1], 2, KNOB_W, |ui| {
+                ui.add(Knob::new(&mut e.low_cut_hz, "Corta grave").range(20.0, 400.0, 20.0).step(5.0).format(fmt_low_cut).accent(theme::EQ))
+                    .on_hover_text("Tira o grave abaixo daqui: aperta o som com muito ganho e limpa o embolado.");
+                ui.add(
+                    Knob::new(&mut e.high_cut_hz, "Corta agudo").range(2000.0, 20000.0, 20000.0).step(100.0).format(fmt_high_cut).accent(theme::EQ),
+                )
+                .on_hover_text("Tira o agudo acima daqui: some o chiado e o \"zumbido de abelha\" da distorção.");
+            });
         });
     });
 }
@@ -1552,6 +1889,18 @@ fn freq_label(f: f32) -> String {
     } else {
         format!("{f:.0}")
     }
+}
+
+fn fmt_range(v: f32) -> String {
+    if v >= 90.0 { "total".into() } else { format!("-{v:.0} dB") }
+}
+
+fn fmt_low_cut(v: f32) -> String {
+    if v <= 20.5 { "desl.".into() } else { format!("{v:.0} Hz") }
+}
+
+fn fmt_high_cut(v: f32) -> String {
+    if v >= 19500.0 { "desl.".into() } else { freq_label((v / 100.0).round() * 100.0) }
 }
 
 fn fmt_pct(v: f32) -> String {
