@@ -4,6 +4,7 @@ mod analysis;
 mod audio;
 mod dsp;
 mod gui;
+mod instance;
 mod meters;
 mod paths;
 mod preset;
@@ -12,20 +13,30 @@ mod settings;
 fn init_log() {
     let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("guitarforge=info,warn"));
     // sem console na versão release: o log vai para %APPDATA%\GuitarForge\guitarforge.log
-    if !cfg!(debug_assertions) {
-        if let Ok(file) = std::fs::File::create(paths::log_file()) {
-            builder.target(env_logger::Target::Pipe(Box::new(file)));
-        }
+    if !cfg!(debug_assertions)
+        && let Ok(file) = std::fs::File::create(paths::log_file())
+    {
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
     }
     builder.init();
     std::panic::set_hook(Box::new(|info| log::error!("pânico: {info}")));
 }
 
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    // a janela (sem opção de diagnóstico) é uma só; olhar antes do log, que a segunda cópia apagaria ao criá-lo
+    let window = !args.iter().skip(1).any(|a| a.starts_with("--"));
+    let instance = if window {
+        match instance::claim() {
+            instance::Claim::Second => return Ok(()),
+            instance::Claim::First(i) => i,
+        }
+    } else {
+        None
+    };
     init_log();
     log::info!("GuitarForge v{}", env!("CARGO_PKG_VERSION"));
 
-    let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--dispositivos") {
         println!("{}", audio::describe());
         return Ok(());
@@ -116,5 +127,5 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    gui::run()
+    gui::run(instance)
 }

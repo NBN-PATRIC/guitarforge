@@ -157,7 +157,7 @@ impl Oversampler {
             f(&mut self.a);
             for stage in self.down.iter_mut().rev() {
                 self.b.clear();
-                for pair in self.a.chunks_exact(2) {
+                for pair in self.a.as_chunks::<2>().0 {
                     self.b.push(stage.tick(pair[0], pair[1]));
                 }
                 std::mem::swap(&mut self.a, &mut self.b);

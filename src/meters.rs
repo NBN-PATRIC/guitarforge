@@ -41,6 +41,8 @@ pub struct Meters {
     /// Amostras enfileiradas no dispositivo de saída no modo exclusivo (0 no compartilhado).
     pub out_queue: AtomicU32,
     pub underruns: AtomicU32,
+    /// Pacotes que a entrada exclusiva perdeu (o Windows avisa buraco no áudio do cabo: a thread atrasou).
+    pub in_glitches: AtomicU32,
     /// Amostras jogadas fora pela saída porque o anel encheu demais (estalo que não conta como falha).
     pub ring_drops: AtomicU32,
     /// Amostras pedidas pela saida exclusiva desde a abertura (o dispositivo tem de pedir a taxa dele por segundo).
@@ -76,6 +78,7 @@ impl Meters {
             ring_fill: AtomicU32::new(0),
             out_queue: AtomicU32::new(0),
             underruns: AtomicU32::new(0),
+            in_glitches: AtomicU32::new(0),
             ring_drops: AtomicU32::new(0),
             out_frames: std::sync::atomic::AtomicU64::new(0),
             out_fallback: AtomicU32::new(0),
@@ -95,6 +98,7 @@ impl Meters {
 
     pub fn reset_engine_counters(&self) {
         self.underruns.store(0, Relaxed);
+        self.in_glitches.store(0, Relaxed);
         self.ring_drops.store(0, Relaxed);
         self.out_fallback.store(0, Relaxed);
         self.in_gap_max_us.store(0, Relaxed);

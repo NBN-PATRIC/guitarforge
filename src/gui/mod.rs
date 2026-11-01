@@ -29,7 +29,8 @@ const GAP: f32 = 12.0;
 const CARD_PAD: f32 = 12.0;
 const LABEL_W: f32 = 64.0;
 
-pub fn run() -> anyhow::Result<()> {
+/// `instance`: a marca de janela única; outra cópia aberta depois chama esta para a frente.
+pub fn run(instance: Option<crate::instance::Instance>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("GuitarForge")
@@ -43,8 +44,16 @@ pub fn run() -> anyhow::Result<()> {
     eframe::run_native(
         "GuitarForge",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
+            if let Some(i) = instance {
+                let ctx = cc.egui_ctx.clone();
+                i.watch(move || {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint();
+                });
+            }
             Ok(Box::new(App::new(true)))
         }),
     )
@@ -154,7 +163,19 @@ struct App {
     clip_until: Instant,
     needle: f32,
     dirty: bool,
+    /// Próximo envio é uma troca de preset (a cadeia troca no silêncio curto, sem estalo).
+    switching: bool,
+    /// O áudio abre depois do primeiro quadro: antes disso a janela nem aparece, e quem esperava clicava de novo.
+    start_pending: bool,
+    frames: u32,
+    /// Cabo perdido: quando foi a última procura e se ele estava na lista nela. Volta sozinho quando reaparece.
+    reconnect: Option<(Instant, bool)>,
+    /// No automático sem o cabo o app abre no microfone padrão; de tempos em tempos olha se o cabo apareceu.
+    cable_check: Instant,
     last_save: Instant,
+    /// Janela estreita (menos de 1200 pontos): a barra de cima encolhe medidores e textos para nada se cobrir
+    /// (a 1000, sem áudio, o GRAVAR tapava o botão Áudio…, que é o que se precisa justamente aí).
+    compact: bool,
     /// `--print`: destino e quadros desenhados até agora.
     print: Option<(PathBuf, u32)>,
     print_bottom: bool,
@@ -200,17 +221,19 @@ impl App {
             clip_until: now,
             needle: 0.0,
             dirty: false,
+            switching: false,
+            reconnect: None,
+            cable_check: now,
+            start_pending: false,
+            frames: 0,
+            compact: false,
             last_save: now,
             print: None,
             print_bottom: false,
         };
-        if let Some(path) = app.state.preset.ir_path.clone() {
-            app.load_ir(PathBuf::from(path), false);
-        }
+        app.load_preset_ir();
         app.reset_strings();
-        if audio {
-            app.start_engine();
-        }
+        app.start_pending = audio;
         app
     }
 
@@ -227,7 +250,8 @@ impl App {
         self.engine = None;
         self.sent = None;
         let settings = self.effective_settings();
-        match Engine::start(
+        let started = Instant::now();
+        let result = Engine::start(
             self.state.input_device.as_deref(),
             self.state.output_device.as_deref(),
             self.state.latency,
@@ -235,7 +259,9 @@ impl App {
             self.state.oversample,
             &settings,
             self.meters.clone(),
-        ) {
+        );
+        log::info!("abrir o áudio levou {} ms", started.elapsed().as_millis());
+        match result {
             Ok(engine) => {
                 if let Some(ir) = &self.ir {
                     engine.send_ir(Some(ir.convolver(engine.info.rate)));
@@ -251,22 +277,47 @@ impl App {
         }
     }
 
-    fn load_ir(&mut self, path: PathBuf, enable: bool) {
-        match ImpulseResponse::load(&path) {
+    /// IR escolhido no diálogo: vira uma cópia na pasta de IRs do app, que é o que o preset guarda.
+    fn load_ir(&mut self, path: PathBuf) {
+        match ImpulseResponse::import_into(&path, &paths::irs_dir()) {
             Ok(ir) => {
-                if let Some(e) = &self.engine {
-                    e.send_ir(Some(ir.convolver(e.info.rate)));
-                }
-                self.state.preset.ir_path = Some(path.to_string_lossy().into_owned());
-                if enable {
-                    self.state.preset.settings.cab.on = true;
-                    self.state.preset.settings.cab.use_ir = true;
-                }
-                self.ir = Some(ir);
-                self.ir_error = None;
-                self.dirty = true;
+                self.state.preset.settings.cab.on = true;
+                self.state.preset.settings.cab.use_ir = true;
+                self.use_ir(ir);
             }
+            // o IR que estava tocando continua
             Err(e) => self.ir_error = Some(format!("{e:#}")),
+        }
+    }
+
+    fn use_ir(&mut self, ir: ImpulseResponse) {
+        if let Some(e) = &self.engine {
+            e.send_ir(Some(ir.convolver(e.info.rate)));
+        }
+        self.state.preset.ir_path = Some(ir.path.to_string_lossy().into_owned());
+        self.state.preset.ir_file = ir.stored.clone();
+        self.ir = Some(ir);
+        self.ir_error = None;
+        self.dirty = true;
+    }
+
+    /// IR do preset atual. Se não achar, tira o IR (volta ao gabinete interno) e avisa: antes continuava tocando o
+    /// IR do preset anterior, sem aviso.
+    fn load_preset_ir(&mut self) {
+        let p = &self.state.preset;
+        let Some(result) = ImpulseResponse::for_preset(p.ir_file.as_deref(), p.ir_path.as_deref(), &paths::irs_dir()) else {
+            return;
+        };
+        match result {
+            Ok(ir) => self.use_ir(ir),
+            Err(e) => {
+                log::warn!("IR do preset: {e:#}");
+                self.ir = None;
+                if let Some(engine) = &self.engine {
+                    engine.send_ir(None);
+                }
+                self.ir_error = Some(format!("IR do preset não encontrado ({e:#}); usando o gabinete interno"));
+            }
         }
     }
 
@@ -276,7 +327,7 @@ impl App {
             dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.pick_file() {
-            self.load_ir(path, true);
+            self.load_ir(path);
         }
     }
 
@@ -284,6 +335,7 @@ impl App {
         self.ir = None;
         self.ir_error = None;
         self.state.preset.ir_path = None;
+        self.state.preset.ir_file = None;
         self.state.preset.settings.cab.use_ir = false;
         if let Some(e) = &self.engine {
             e.send_ir(None);
@@ -299,16 +351,20 @@ impl App {
         // a supressão de ruído é do cabo e da guitarra, não do som: não muda com o preset
         p.settings.gate = current.gate;
         self.baseline = p.settings;
-        let ir_path = p.ir_path.clone();
+        self.switching = true;
+        let has_ir = p.ir_file.is_some() || p.ir_path.is_some();
         self.state.preset = p;
-        match ir_path {
-            Some(path) => self.load_ir(PathBuf::from(path), false),
-            None => self.state.preset.ir_path = self.ir.as_ref().map(|ir| ir.path.to_string_lossy().into_owned()),
+        if has_ir {
+            self.load_preset_ir();
+        } else {
+            // preset sem IR (os de fábrica): o IR carregado fica à mão, desligado pelo próprio preset
+            self.state.preset.ir_path = self.ir.as_ref().map(|ir| ir.path.to_string_lossy().into_owned());
+            self.state.preset.ir_file = self.ir.as_ref().and_then(|ir| ir.stored.clone());
         }
-        if let Some(id) = self.state.preset.tuning.clone() {
-            if self.tunings.iter().any(|t| t.id() == id) {
-                self.select_tuning(id);
-            }
+        if let Some(id) = self.state.preset.tuning.clone()
+            && self.tunings.iter().any(|t| t.id() == id)
+        {
+            self.select_tuning(id);
         }
         self.dirty = true;
     }
@@ -366,6 +422,12 @@ impl App {
         }
     }
 
+    /// A entrada escolhida (ou um cabo Rocksmith, no automático) está na lista de dispositivos do Windows.
+    fn input_listed(&self) -> bool {
+        let wanted = self.state.input_device.as_deref();
+        audio::list_devices().inputs.iter().any(|n| Some(n.as_str()) == wanted || audio::is_rocksmith(n))
+    }
+
     fn open_audio_dialog(&mut self) {
         self.devices = audio::list_devices();
         self.audio_dialog = Some(AudioDialog {
@@ -390,7 +452,30 @@ impl App {
         if self.engine.is_some() && self.meters.device_error.swap(false, Relaxed) {
             self.stop_recording();
             self.engine = None;
-            self.engine_error = Some("O dispositivo de áudio parou de responder (cabo desconectado?).".into());
+            self.engine_error =
+                Some("O dispositivo de áudio parou de responder (cabo desconectado?). Religa sozinho quando o cabo voltar.".into());
+            self.reconnect = Some((Instant::now(), self.input_listed()));
+        }
+        let on_other_input = self.engine.as_ref().is_some_and(|e| !audio::is_rocksmith(&e.info.input));
+        if on_other_input && self.state.input_device.is_none() && self.cable_check.elapsed() > Duration::from_secs(3) {
+            self.cable_check = Instant::now();
+            if audio::list_devices().inputs.iter().any(|n| audio::is_rocksmith(n)) {
+                log::info!("o cabo Rocksmith apareceu, passando para ele");
+                self.start_engine();
+            }
+        }
+        if self.engine.is_some() {
+            self.reconnect = None;
+        } else if let Some((at, was_listed)) = self.reconnect {
+            // só religa quando o cabo some da lista e volta: travado e ainda listado, fica no "Tentar de novo"
+            if at.elapsed() > Duration::from_secs(2) {
+                let listed = self.input_listed();
+                self.reconnect = Some((Instant::now(), listed));
+                if listed && !was_listed {
+                    log::info!("o cabo voltou, religando o áudio");
+                    self.start_engine();
+                }
+            }
         }
         if let Some(e) = &self.engine {
             e.collect_trash();
@@ -515,11 +600,14 @@ impl App {
     fn sync(&mut self) {
         let eff = self.effective_settings();
         if self.sent != Some(eff) {
-            if let Some(e) = &self.engine {
-                if e.send_settings(eff) {
-                    self.sent = Some(eff);
-                }
+            if let Some(e) = &self.engine
+                && e.send_settings(eff, self.switching)
+            {
+                self.sent = Some(eff);
+                self.switching = false;
             }
+        } else {
+            self.switching = false;
         }
         if self.state.preset.settings != self.last_seen {
             self.last_seen = self.state.preset.settings;
@@ -554,9 +642,18 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+        self.frames = self.frames.saturating_add(1);
+        if self.start_pending && self.frames >= 3 {
+            // a janela já está na tela com "Abrindo o áudio…"; agora pode demorar
+            self.start_pending = false;
+            log::info!("janela na tela, abrindo o áudio");
+            self.start_engine();
+        }
         self.poll();
 
-        if !ctx.wants_keyboard_input() {
+        // só um campo de texto (diálogo de salvar ou de afinação) cala os atalhos; knob selecionado não
+        let typing = self.save_name.is_some() || self.tuning_editor.is_some();
+        if !typing {
             let (mute, tune, rec, noise) =
                 ctx.input(|i| (i.key_pressed(Key::M), i.key_pressed(Key::T), i.key_pressed(Key::R), i.key_pressed(Key::N)));
             if noise {
@@ -578,6 +675,7 @@ impl eframe::App for App {
 
         // topo, rodapé e rack usam a mesma margem lateral: tudo alinha na mesma coluna
         let side = ((ctx.screen_rect().width() - MAX_W) / 2.0).max(MIN_SIDE).floor();
+        self.compact = ctx.screen_rect().width() < 1200.0;
         self.top_bar(ctx, side);
         self.bottom_bar(ctx, side);
         egui::CentralPanel::default()
@@ -623,7 +721,7 @@ impl App {
                         ui.label(RichText::new("GuitarForge").size(25.0).strong().color(theme::AMBER));
                         ui.label(RichText::new("amp para o cabo Rocksmith").size(11.5).color(theme::DIM));
                     });
-                    ui.add_space(18.0);
+                    ui.add_space(if self.compact { 10.0 } else { 18.0 });
                     self.status_pill(ui);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         self.mute_button(ui);
@@ -657,7 +755,7 @@ impl App {
                                 led.on_hover_text("O cabo Rocksmith não foi encontrado, usando outra entrada.");
                             }
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(short_name(&e.info.input, 32)).strong());
+                                ui.label(RichText::new(short_name(&e.info.input, if self.compact { 22 } else { 32 })).strong());
                                 ui.label(
                                     RichText::new(format!(
                                         "{} · atraso do app ~{:.0} ms",
@@ -670,12 +768,20 @@ impl App {
                                 .on_hover_text(format!("Saída: {}", e.info.output));
                             });
                         }
+                        None if self.start_pending => {
+                            widgets::led(ui, true, theme::YELLOW);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Abrindo o áudio…").strong());
+                                ui.label(RichText::new("procurando o cabo e a saída").small().color(theme::DIM));
+                            });
+                        }
                         None => {
                             widgets::led(ui, true, theme::RED);
                             let err = self.engine_error.clone().unwrap_or_else(|| "parado".into());
                             ui.vertical(|ui| {
                                 ui.label(RichText::new("Sem áudio").strong().color(theme::RED));
-                                ui.label(RichText::new(truncate(&err, 58)).small().color(theme::DIM)).on_hover_text(err);
+                                let max = if self.compact { 26 } else { 58 };
+                                ui.label(RichText::new(truncate(&err, max)).small().color(theme::DIM)).on_hover_text(err);
                             });
                             retry = ui.button("Tentar de novo").clicked();
                         }
@@ -718,7 +824,7 @@ impl App {
             .fill(if recording.is_some() { theme::RED.gamma_multiply(0.5) } else { theme::CARD })
             .stroke(Stroke::new(1.0_f32, if recording.is_some() { theme::RED } else { theme::FAINT }))
             .rounding(8.0)
-            .min_size(vec2(122.0, 38.0));
+            .min_size(vec2(if self.compact { 104.0 } else { 122.0 }, 38.0));
         let resp = ui
             .add_enabled(self.engine.is_some(), button)
             .on_hover_text("Grava o som processado e o sinal seco do cabo (DI) em Música\\GuitarForge (tecla R)");
@@ -733,18 +839,19 @@ impl App {
 
     fn level_meters(&self, ui: &mut Ui) {
         let clip = Instant::now() < self.clip_until;
-        ui.allocate_ui(vec2(230.0, 60.0), |ui| {
+        let bar = if self.compact { 64.0 } else { 120.0 };
+        ui.allocate_ui(vec2(bar + 110.0, 60.0), |ui| {
             ui.vertical(|ui| {
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.add_sized([54.0, 14.0], Label::new(RichText::new("ENTRADA").small().color(theme::DIM)));
-                    widgets::level_bar(ui, self.in_db, self.in_hold, 120.0)
+                    widgets::level_bar(ui, self.in_db, self.in_hold, bar)
                         .on_hover_text(format!("Pico do cabo: {:.1} dBFS", self.in_hold));
                     ui.label(RichText::new("CLIP").small().strong().color(if clip { theme::RED } else { theme::FAINT }));
                 });
                 ui.horizontal(|ui| {
                     ui.add_sized([54.0, 14.0], Label::new(RichText::new("SAÍDA").small().color(theme::DIM)));
-                    widgets::level_bar(ui, self.out_db, -90.0, 120.0);
+                    widgets::level_bar(ui, self.out_db, -90.0, bar);
                 });
             })
         });
@@ -778,7 +885,7 @@ impl App {
                         .small()
                         .color(theme::DIM),
                     );
-                    let underruns = m.underruns.load(Relaxed);
+                    let underruns = m.underruns.load(Relaxed) + m.in_glitches.load(Relaxed);
                     if underruns > 0 {
                         ui.add_space(8.0);
                         ui.label(RichText::new(format!("falhas de áudio: {underruns}")).small().color(theme::YELLOW))
@@ -862,6 +969,7 @@ impl App {
             self.state.preset.settings.mute = keep.mute;
             self.state.preset.settings.input_gain_db = keep.input_gain_db;
             self.state.preset.settings.gate = keep.gate;
+            self.switching = true;
         }
         if save {
             self.save_error = None;
@@ -1150,12 +1258,12 @@ impl App {
                 Err(e) => ed.error = Some(e),
             }
         }
-        if delete {
-            if let Some(id) = ed.original.clone() {
-                match self.delete_tuning(&id) {
-                    Ok(()) => keep_open = false,
-                    Err(e) => ed.error = Some(e),
-                }
+        if delete
+            && let Some(id) = ed.original.clone()
+        {
+            match self.delete_tuning(&id) {
+                Ok(()) => keep_open = false,
+                Err(e) => ed.error = Some(e),
             }
         }
         if keep_open {
@@ -1196,14 +1304,25 @@ impl App {
         });
 
         ui.add_space(18.0);
-        section_title(ui, "DEPOIS DO AMP", "equalizador, eco e ambiência");
-        let w = card_widths(total, &[400.0, 230.0, 150.0]);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = GAP;
-            eq_panel(ui, s, w[0]);
-            delay_panel(ui, s, w[1]);
-            reverb_panel(ui, s, w[2]);
-        });
+        section_title(ui, "DEPOIS DO AMP", "equalizador, eco, estéreo e ambiência");
+        for (i, row) in balanced_rows(total, &Post::ALL, Post::min_w).iter().enumerate() {
+            if i > 0 {
+                ui.add_space(GAP);
+            }
+            let mins: Vec<f32> = row.iter().map(|p| p.min_w()).collect();
+            let w = card_widths(total, &mins);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                for (&p, &w) in row.iter().zip(&w) {
+                    match p {
+                        Post::Eq => eq_panel(ui, s, w),
+                        Post::Delay => delay_panel(ui, s, w),
+                        Post::Spread => spread_panel(ui, s, w),
+                        Post::Reverb => reverb_panel(ui, s, w),
+                    }
+                }
+            });
+        }
         ui.add_space(12.0);
 
         match action {
@@ -1420,7 +1539,7 @@ fn short_name(name: &str, max: usize) -> String {
 }
 
 fn khz(rate: u32) -> String {
-    if rate % 1000 == 0 { format!("{} kHz", rate / 1000) } else { format!("{:.1} kHz", rate as f32 / 1000.0) }
+    if rate.is_multiple_of(1000) { format!("{} kHz", rate / 1000) } else { format!("{:.1} kHz", rate as f32 / 1000.0) }
 }
 
 fn drive_color(kind: DriveKind) -> Color32 {
@@ -1471,7 +1590,7 @@ fn chain_strip(ui: &mut Ui, s: &mut Settings) {
     };
     fixed(ui, "Cabo");
     let drive = drive_color(s.drive.kind);
-    let stages: [(&str, &mut bool, Color32); 15] = [
+    let stages: [(&str, &mut bool, Color32); 16] = [
         ("Gate", &mut s.gate.on, theme::GATE),
         ("Comp", &mut s.comp.on, theme::COMP),
         ("Wah", &mut s.wah.on, theme::WAH),
@@ -1486,6 +1605,7 @@ fn chain_strip(ui: &mut Ui, s: &mut Settings) {
         ("Gabinete", &mut s.cab.on, theme::CAB),
         ("EQ", &mut s.eq.on, theme::EQ),
         ("Delay", &mut s.delay.on, theme::DELAY),
+        ("Estéreo", &mut s.spread.on, theme::SPREAD),
         ("Reverb", &mut s.reverb.on, theme::REVERB),
     ];
     for (label, on, color) in stages {
@@ -1914,6 +2034,39 @@ fn delay_panel(ui: &mut Ui, s: &mut Settings, w: f32) {
             ui.add(Knob::new(&mut d.time_ms, "Tempo").range(40.0, 1200.0, 380.0).step(5.0).format(fmt_ms).accent(theme::DELAY));
             ui.add(Knob::new(&mut d.feedback, "Repetições").range(0.0, 0.9, 0.35).step(0.01).format(fmt_pct).accent(theme::DELAY));
             ui.add(Knob::new(&mut d.mix, "Mix").default_value(0.3).accent(theme::DELAY));
+        });
+    });
+}
+
+/// Cartões depois do amplificador, na ordem do sinal.
+#[derive(Clone, Copy)]
+enum Post {
+    Eq,
+    Delay,
+    Spread,
+    Reverb,
+}
+
+impl Post {
+    const ALL: [Post; 4] = [Self::Eq, Self::Delay, Self::Spread, Self::Reverb];
+
+    fn min_w(self) -> f32 {
+        match self {
+            Self::Eq => 400.0,
+            Self::Delay => 230.0,
+            Self::Spread | Self::Reverb => 150.0,
+        }
+    }
+}
+
+fn spread_panel(ui: &mut Ui, s: &mut Settings, w: f32) {
+    let c = &mut s.spread;
+    card(ui, "Estéreo", "Abre o som no fone", theme::SPREAD, &mut c.on, w, FX_BODY, |ui| {
+        even_row(ui, 1, KNOB_W, |ui| {
+            ui.add(Knob::new(&mut c.width, "Largura").default_value(0.5).accent(theme::SPREAD)).on_hover_text(
+                "Uma cópia do som entra num lado e sai do outro: no fone, o som deixa de soar dentro da cabeça. \
+                 O grave fica no meio, e numa caixa de som mono nada muda.",
+            );
         });
     });
 }

@@ -283,6 +283,19 @@ impl Default for TremoloCfg {
     }
 }
 
+/// Estéreo por dobra (depois do delay, antes do reverb): `width` de 0 (mono) a 1.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpreadCfg {
+    pub on: bool,
+    pub width: f32,
+}
+
+impl Default for SpreadCfg {
+    fn default() -> Self {
+        Self { on: false, width: 0.5 }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -333,6 +346,7 @@ pub struct Settings {
     pub cab: CabCfg,
     pub eq: EqCfg,
     pub delay: DelayCfg,
+    pub spread: SpreadCfg,
     pub reverb: ReverbCfg,
 }
 
@@ -356,6 +370,7 @@ impl Default for Settings {
             cab: CabCfg::default(),
             eq: EqCfg::default(),
             delay: DelayCfg::default(),
+            spread: SpreadCfg::default(),
             reverb: ReverbCfg::default(),
         }
     }

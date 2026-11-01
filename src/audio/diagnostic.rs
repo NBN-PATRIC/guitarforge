@@ -30,7 +30,9 @@ pub fn run(seconds: u64, exclusive: Exclusive, latency: LatencyMode, oversample:
         &settings,
         meters.clone(),
     )?;
-    let ir = state.preset.ir_path.as_ref().filter(|_| settings.cab.use_ir).and_then(|p| ImpulseResponse::load(Path::new(p)).ok());
+    let ir = ImpulseResponse::for_preset(state.preset.ir_file.as_deref(), state.preset.ir_path.as_deref(), &crate::paths::irs_dir())
+        .and_then(|r| r.ok())
+        .filter(|_| settings.cab.use_ir);
     if let Some(ir) = &ir {
         engine.send_ir(Some(ir.convolver(engine.info.rate)));
     }
@@ -51,15 +53,18 @@ pub fn run(seconds: u64, exclusive: Exclusive, latency: LatencyMode, oversample:
     std::thread::sleep(Duration::from_millis(500));
     while tap.pop().is_ok() {}
     meters.underruns.store(0, Relaxed);
+    meters.in_glitches.store(0, Relaxed);
     meters.ring_drops.store(0, Relaxed);
     meters.recording.store(true, Relaxed);
     let end = Instant::now() + Duration::from_secs(seconds);
     let (mut fill_min, mut fill_max) = (u32::MAX, 0u32);
     while Instant::now() < end {
         std::thread::sleep(Duration::from_millis(10));
-        while rec.slots() >= 2 {
+        // seco, esquerdo e direito; a comparação usa o esquerdo
+        while rec.slots() >= 3 {
             dry.push(rec.pop().unwrap_or(0.0));
             wet.push(rec.pop().unwrap_or(0.0));
+            let _ = rec.pop();
         }
         while let Ok(v) = tap.pop() {
             sent.push(v);
@@ -79,8 +84,9 @@ pub fn run(seconds: u64, exclusive: Exclusive, latency: LatencyMode, oversample:
     );
     let _ = writeln!(
         out,
-        "anel entre {fill_min} e {fill_max} amostras; falhas (anel vazio) {}; amostras descartadas (anel cheio) {}; gravador perdeu {}; erro de dispositivo {}",
+        "anel entre {fill_min} e {fill_max} amostras; falhas (anel vazio) {}; buracos na entrada exclusiva {}; amostras descartadas (anel cheio) {}; gravador perdeu {}; erro de dispositivo {}",
         meters.underruns.load(Relaxed),
+        meters.in_glitches.load(Relaxed),
         meters.ring_drops.load(Relaxed),
         meters.rec_dropped.load(Relaxed),
         meters.device_error.load(Relaxed)
@@ -99,9 +105,10 @@ pub fn run(seconds: u64, exclusive: Exclusive, latency: LatencyMode, oversample:
         chain.cabinet.swap_convolver(Some(ir.convolver(rate)));
     }
     let mut offline = dry.clone();
+    let mut offline_right = vec![0.0; offline.len()];
     let block = (meters.in_block.load(Relaxed) as usize).max(32);
-    for b in offline.chunks_mut(block) {
-        chain.process(b);
+    for (l, r) in offline.chunks_mut(block).zip(offline_right.chunks_mut(block)) {
+        chain.process_stereo(l, r);
     }
     let skip = rate as usize;
     if wet.len() > skip * 2 {

@@ -76,7 +76,7 @@ fn run(mut rx: rtrb::Consumer<f32>, sr: f32, m: &Meters) {
                 window.clear();
                 window.extend((0..len).map(|i| clean[(start + i) % hist_len]));
                 decimated.clear();
-                decimated.extend(window.chunks_exact(2).map(|p| 0.5 * (p[0] + p[1])));
+                decimated.extend(window.as_chunks::<2>().0.iter().map(|p| 0.5 * (p[0] + p[1])));
                 if let Some(f) = tuner::detect(&decimated, sr / 2.0, fmin, 1100.0, target) {
                     m.pitch_hz.set(f);
                     last_pitch = now;
@@ -125,7 +125,7 @@ pub fn analyze_file(path: &std::path::Path, fmin: f32, target: Option<f32>) -> a
         let level = lin_to_db((tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt());
         let hz = if level > SILENCE_DB {
             decimated.clear();
-            decimated.extend(filtered.chunks_exact(2).map(|p| 0.5 * (p[0] + p[1])));
+            decimated.extend(filtered.as_chunks::<2>().0.iter().map(|p| 0.5 * (p[0] + p[1])));
             tuner::detect(&decimated, sr / 2.0, fmin, 1100.0, target)
         } else {
             None

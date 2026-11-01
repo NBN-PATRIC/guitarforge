@@ -11,7 +11,7 @@ use crate::meters::Meters;
 
 type Writer = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
 
-/// Gravação em andamento: dois WAV float 32 bits, o som processado e o sinal seco do cabo (DI).
+/// Gravação em andamento: dois WAV float 32 bits, o som processado (estéreo) e o sinal seco do cabo (DI, mono).
 pub struct Recording {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<(rtrb::Consumer<f32>, Result<()>)>,
@@ -36,7 +36,7 @@ pub fn start(
         std::fs::create_dir_all(dir).with_context(|| format!("criando {}", dir.display()))?;
         let (wet_path, dry_path) = next_free_name(dir);
         let spec = hound::WavSpec { channels: 1, sample_rate: rate, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
-        let wet = hound::WavWriter::create(&wet_path, spec)?;
+        let wet = hound::WavWriter::create(&wet_path, hound::WavSpec { channels: 2, ..spec })?;
         let dry = hound::WavWriter::create(&dry_path, spec)?;
         Ok((wet_path, wet, dry))
     })();
@@ -56,11 +56,15 @@ pub fn start(
         .spawn(move || {
             let mut result = Ok(());
             loop {
-                while rx.slots() >= 2 {
-                    if let (Ok(d), Ok(w)) = (rx.pop(), rx.pop()) {
-                        if result.is_ok() {
-                            result = dry.write_sample(d).and_then(|_| wet.write_sample(w)).map_err(anyhow::Error::from);
-                        }
+                while rx.slots() >= 3 {
+                    if let (Ok(d), Ok(l), Ok(r)) = (rx.pop(), rx.pop(), rx.pop())
+                        && result.is_ok()
+                    {
+                        result = dry
+                            .write_sample(d)
+                            .and_then(|_| wet.write_sample(l))
+                            .and_then(|_| wet.write_sample(r))
+                            .map_err(anyhow::Error::from);
                     }
                 }
                 if stop_flag.load(Relaxed) {

@@ -12,7 +12,10 @@ use crate::settings::{AmpChannel, CabKind, DriveKind, Settings};
 pub struct Preset {
     pub name: String,
     pub settings: Settings,
+    /// Onde o IR estava quando foi escolhido (só informação: o som vem de `ir_file`).
     pub ir_path: Option<String>,
+    /// Cópia do IR na pasta de IRs do app (`%APPDATA%\GuitarForge\irs`).
+    pub ir_file: Option<String>,
     /// Afinação do preset (id de `Tuning::id`): carregar o som de uma música já troca o afinador.
     pub tuning: Option<String>,
     #[serde(skip)]
@@ -21,14 +24,14 @@ pub struct Preset {
 
 impl Default for Preset {
     fn default() -> Self {
-        Self { name: "Sem nome".into(), settings: Settings::default(), ir_path: None, tuning: None, factory: false }
+        Self { name: "Sem nome".into(), settings: Settings::default(), ir_path: None, ir_file: None, tuning: None, factory: false }
     }
 }
 
 impl Preset {
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json).with_context(|| format!("gravando {}", path.display()))
+        paths::write_atomic(path, json.as_bytes()).with_context(|| format!("gravando {}", path.display()))
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -40,7 +43,7 @@ impl Preset {
 fn make(name: &str, edit: impl FnOnce(&mut Settings)) -> Preset {
     let mut s = Settings::default();
     edit(&mut s);
-    Preset { name: name.into(), settings: s, ir_path: None, tuning: None, factory: true }
+    Preset { name: name.into(), settings: s, ir_path: None, ir_file: None, tuning: None, factory: true }
 }
 
 pub fn factory() -> Vec<Preset> {
@@ -55,6 +58,7 @@ pub fn factory() -> Vec<Preset> {
             s.chorus.rate = 0.25;
             s.chorus.depth = 0.4;
             s.chorus.mix = 0.35;
+            s.spread.on = true;
             s.reverb.size = 0.55;
             s.reverb.mix = 0.25;
         }),
@@ -98,11 +102,12 @@ pub fn factory() -> Vec<Preset> {
             s.amp.treble = 0.55;
             s.cab.kind = CabKind::Closed4x12;
             s.delay.on = true;
+            s.spread.on = true;
+            s.spread.width = 0.4;
             s.reverb.size = 0.5;
             s.reverb.mix = 0.22;
         }),
         make("Metal", |s| {
-            s.gate.threshold_db = -48.0;
             s.amp.channel = AmpChannel::Lead;
             s.amp.gain = 0.85;
             s.amp.bass = 0.65;
@@ -128,6 +133,8 @@ pub fn factory() -> Vec<Preset> {
             s.delay.time_ms = 520.0;
             s.delay.feedback = 0.5;
             s.delay.mix = 0.35;
+            s.spread.on = true;
+            s.spread.width = 0.75;
             s.reverb.size = 0.85;
             s.reverb.mix = 0.4;
         }),
@@ -150,6 +157,8 @@ pub fn factory() -> Vec<Preset> {
             s.tremolo.rate = 0.45;
             s.tremolo.depth = 0.6;
             s.tremolo.shape = 0.2;
+            s.spread.on = true;
+            s.spread.width = 0.4;
             s.reverb.size = 0.7;
             s.reverb.mix = 0.35;
         }),
@@ -165,6 +174,8 @@ pub fn factory() -> Vec<Preset> {
             s.drive.gain = 0.6;
             s.phaser.on = true;
             s.phaser.rate = 0.25;
+            s.spread.on = true;
+            s.spread.width = 0.6;
             s.reverb.size = 0.4;
             s.reverb.mix = 0.2;
         }),
@@ -216,6 +227,13 @@ pub fn user_preset_path(name: &str) -> PathBuf {
         .chars()
         .map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' })
         .collect();
+    // nomes que o Windows reserva para dispositivos (CON, NUL, COM1...) não podem virar arquivo
+    let upper = clean.trim_end().to_uppercase();
+    let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&upper.as_str())
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit());
+    let clean = if reserved || clean.is_empty() { format!("_{clean}") } else { clean };
     paths::presets_dir().join(format!("{clean}.json"))
 }
 
@@ -241,7 +259,7 @@ pub fn custom_tunings() -> Vec<Tuning> {
 pub fn save_custom_tunings(list: &[Tuning]) -> Result<()> {
     let path = paths::tunings_file();
     let json = serde_json::to_string_pretty(list)?;
-    std::fs::write(&path, json).with_context(|| format!("gravando {}", path.display()))
+    paths::write_atomic(&path, json.as_bytes()).with_context(|| format!("gravando {}", path.display()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -371,7 +389,7 @@ impl AppState {
         let path = paths::state_file();
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = paths::write_atomic(&path, json.as_bytes()) {
                     log::warn!("não consegui gravar {}: {e}", path.display());
                 }
             }
@@ -406,5 +424,8 @@ mod tests {
     fn preset_file_name_is_sanitized() {
         let p = user_preset_path("Meu/som: teste?");
         assert_eq!(p.file_name().unwrap().to_string_lossy(), "Meu_som_ teste_.json");
+        for (name, file) in [("con", "_con.json"), ("COM1", "_COM1.json"), ("Console", "Console.json"), ("nul ", "_nul.json")] {
+            assert_eq!(user_preset_path(name).file_name().unwrap().to_string_lossy(), file);
+        }
     }
 }

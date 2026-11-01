@@ -22,9 +22,11 @@ computador": clique em "Mais informações" e depois em "Executar assim mesmo". 
   fechamento ajustáveis até 2 segundos, e filtro do zumbido da rede (50 ou 60 Hz, detectado sozinho).
 - Pedais: compressor, auto-wah, oitava, boost, drive (overdrive, distorção e fuzz), chorus, phaser, flanger e tremolo.
 - Sobreamostragem do drive e do amp (2x ou 4x) contra o chiado metálico da distorção forte.
-- Amplificador com canais Limpo, Crunch e Lead; gabinete interno ou IR em WAV.
-- Equalizador de 5 faixas com corte de graves e de agudos, delay e reverb.
-- Gravador: salva o som processado e o sinal seco do cabo (DI) em WAV.
+- Amplificador com canais Limpo, Crunch e Lead; gabinete interno ou IR em WAV, guardado junto com o preset.
+- Equalizador de 5 faixas com corte de graves e de agudos, delay, estéreo (abre o som no fone e deixa o grave no
+  meio) e reverb estéreo.
+- Pisar num pedal ou trocar de preset no meio da nota não estala.
+- Gravador: salva o som processado (estéreo) e o sinal seco do cabo (DI) em WAV.
 - Presets de fábrica e seus, que guardam também a afinação.
 - Diagnóstico do ruído de fundo e do zumbido que chegam pelo cabo.
 - Tudo ajustável pelo teclado: clique num knob e use as setas (Shift para ajuste fino).
@@ -79,7 +81,7 @@ GuitarForge is a guitar amp for Windows built around the Rocksmith USB cable (an
 offline, needs no account and is open source. It has a per string tuner (guitar and bass, custom tunings), a noise
 gate with automatic threshold and mains hum filter, WASAPI exclusive mode (about 15 ms of app latency), compressor,
 auto wah, octave, boost, drive, chorus, phaser, flanger, tremolo, a three channel amp with 2x or 4x oversampling,
-built in cabinets or WAV impulse responses, EQ with low and high cut, delay, reverb and a recorder that saves both the
-processed and the dry signal. The interface is in Portuguese. Download the executable from the Releases page, or build
+built in cabinets or WAV impulse responses, EQ with low and high cut, delay, a stereo widener, stereo reverb and a
+recorder that saves both the processed (stereo) and the dry signal. The interface is in Portuguese. Download the executable from the Releases page, or build
 with `cargo run --release` (Rust plus the Visual Studio Build Tools with the Windows SDK). Not affiliated with
 Ubisoft. MIT license.

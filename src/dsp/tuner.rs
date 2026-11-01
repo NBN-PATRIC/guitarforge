@@ -282,7 +282,8 @@ pub fn yin(buf: &[f32], sr: f32, fmin: f32, fmax: f32) -> Option<f32> {
     // quase tão bom quanto o melhor, e o primeiro desses ainda evita o erro de oitava para baixo.
     const MAX_APERIODICITY: f32 = 0.2;
     let best = cmnd[tau_min..=tau_max].iter().copied().fold(f32::INFINITY, f32::min);
-    if best > MAX_APERIODICITY {
+    // `>=`: com o melhor vale exatamente no limite nenhum candidato ficaria abaixo e a busca passaria do fim
+    if best >= MAX_APERIODICITY {
         return None;
     }
     let threshold = (best * 1.5).max(best + 0.02).min(MAX_APERIODICITY);
@@ -293,6 +294,7 @@ pub fn yin(buf: &[f32], sr: f32, fmin: f32, fmax: f32) -> Option<f32> {
     while tau < tau_max && cmnd[tau + 1] < cmnd[tau] {
         tau += 1;
     }
+    let tau = tau.min(tau_max);
 
     let (a, b, c) = (cmnd[tau - 1], cmnd[tau], cmnd[tau + 1]);
     let denom = a - 2.0 * b + c;

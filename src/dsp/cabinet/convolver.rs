@@ -128,10 +128,10 @@ mod tests {
         for chunk in out.chunks_mut(37) {
             conv.process(chunk);
         }
-        for n in PARTITION..input.len() {
+        for (n, &got) in out.iter().enumerate().skip(PARTITION) {
             let k = n - PARTITION;
             let expected: f32 = (0..ir.len()).filter(|&j| j <= k).map(|j| ir[j] * input[k - j]).sum();
-            assert!((out[n] - expected).abs() < 1e-4, "amostra {n}: {} vs {expected}", out[n]);
+            assert!((got - expected).abs() < 1e-4, "amostra {n}: {got} vs {expected}");
         }
     }
 }

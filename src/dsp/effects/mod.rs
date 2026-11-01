@@ -8,6 +8,7 @@ mod flanger;
 mod octave;
 mod phaser;
 mod reverb;
+mod spread;
 mod tremolo;
 mod wah;
 
@@ -21,5 +22,6 @@ pub use flanger::Flanger;
 pub use octave::Octave;
 pub use phaser::Phaser;
 pub use reverb::Reverb;
+pub use spread::Spread;
 pub use tremolo::Tremolo;
 pub use wah::Wah;

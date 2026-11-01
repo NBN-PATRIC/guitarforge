@@ -81,9 +81,26 @@ fn voicing(sr: f32, kind: CabKind) -> [Biquad; 5] {
 /// IR de gabinete lido de um WAV (qualquer taxa, 16/24/32 bits ou float; usa o 1º canal).
 pub struct ImpulseResponse {
     pub name: String,
+    /// Onde o usuário escolheu o arquivo (o diálogo abre ali da próxima vez).
     pub path: PathBuf,
+    /// Nome da cópia na pasta de IRs do app (o que o preset guarda).
+    pub stored: Option<String>,
     samples: Vec<f32>,
     rate: u32,
+}
+
+/// Impressão digital do conteúdo (FNV-1a de 64 bits): o mesmo arquivo carregado duas vezes vira uma cópia só.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// "Marshall 4x12 SM57 a1b2c3d4e5f60718.wav" volta a ser "Marshall 4x12 SM57".
+fn display_name(stored: &str) -> String {
+    let stem = stored.strip_suffix(".wav").unwrap_or(stored);
+    match stem.rsplit_once(' ') {
+        Some((name, hash)) if hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()) => name.to_string(),
+        _ => stem.to_string(),
+    }
 }
 
 impl ImpulseResponse {
@@ -106,7 +123,42 @@ impl ImpulseResponse {
             bail!("o arquivo não tem áudio");
         }
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        Ok(Self { name, path: path.to_path_buf(), samples, rate: spec.sample_rate })
+        Ok(Self { name, path: path.to_path_buf(), stored: None, samples, rate: spec.sample_rate })
+    }
+
+    /// Lê o WAV escolhido e guarda uma cópia em `dir` (nome pelo conteúdo). Mover, renomear ou apagar o original
+    /// depois não quebra mais o preset (até a v0.3 o preset guardava só o caminho).
+    pub fn import_into(path: &Path, dir: &Path) -> Result<Self> {
+        let mut ir = Self::load(path)?;
+        let bytes = std::fs::read(path).with_context(|| format!("lendo {}", path.display()))?;
+        let clean: String =
+            ir.name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
+        let stored = format!("{} {:016x}.wav", clean.trim(), fingerprint(&bytes));
+        let dest = dir.join(&stored);
+        if !dest.exists() {
+            std::fs::create_dir_all(dir).with_context(|| format!("criando {}", dir.display()))?;
+            crate::paths::write_atomic(&dest, &bytes).with_context(|| format!("copiando para {}", dest.display()))?;
+        }
+        ir.stored = Some(stored);
+        Ok(ir)
+    }
+
+    /// IR de um preset: a cópia guardada em `dir`; preset antigo (só com o caminho) importa o original agora.
+    /// `None` se o preset não tem IR.
+    pub fn for_preset(stored: Option<&str>, original: Option<&str>, dir: &Path) -> Option<Result<Self>> {
+        let copy = stored.map(|s| dir.join(s)).filter(|p| p.exists());
+        Some(match (copy, original) {
+            (Some(copy), _) => Self::load(&copy).map(|mut ir| {
+                ir.name = display_name(stored.unwrap_or_default());
+                ir.stored = stored.map(str::to_string);
+                if let Some(o) = original {
+                    ir.path = PathBuf::from(o);
+                }
+                ir
+            }),
+            (None, Some(o)) => Self::import_into(Path::new(o), dir),
+            (None, None) => Err(anyhow::anyhow!("a cópia {} sumiu da pasta de IRs", stored?)),
+        })
     }
 
     /// IR na taxa do motor, cortado em `MAX_IR_LEN`, com fade no fim e energia normalizada.
@@ -172,6 +224,34 @@ mod tests {
         let energy: f32 = prepared.iter().map(|x| x * x).sum();
         assert!((energy - 1.0).abs() < 1e-3);
         assert!(prepared[0] > prepared[500]);
+    }
+
+    #[test]
+    fn preset_keeps_its_ir_after_the_original_moves() {
+        let base = std::env::temp_dir().join(format!("guitarforge-teste-irs-{}", std::process::id()));
+        let (store, original) = (base.join("irs"), base.join("Meu gabinete.wav"));
+        std::fs::create_dir_all(&base).unwrap();
+        let spec = hound::WavSpec { channels: 1, sample_rate: 48000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+        let mut w = hound::WavWriter::create(&original, spec).unwrap();
+        for i in 0..500 {
+            w.write_sample((-(i as f32) / 50.0).exp()).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let ir = ImpulseResponse::import_into(&original, &store).unwrap();
+        let stored = ir.stored.clone().unwrap();
+        assert!(stored.starts_with("Meu gabinete "), "{stored}");
+        // carregar de novo o mesmo arquivo não duplica
+        assert_eq!(ImpulseResponse::import_into(&original, &store).unwrap().stored.unwrap(), stored);
+        // o usuário apagou o original: o preset ainda toca, com o nome de antes
+        std::fs::remove_file(&original).unwrap();
+        let back = ImpulseResponse::for_preset(Some(&stored), original.to_str(), &store).unwrap().unwrap();
+        assert_eq!(back.name, "Meu gabinete");
+        assert_eq!(back.prepare(48000), ir.prepare(48000));
+        // sem cópia e sem original: erro, não um IR qualquer
+        assert!(ImpulseResponse::for_preset(Some("sumiu 0000000000000000.wav"), None, &store).unwrap().is_err());
+        assert!(ImpulseResponse::for_preset(None, None, &store).is_none());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

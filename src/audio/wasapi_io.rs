@@ -125,6 +125,7 @@ pub fn open_capture(name: &str, period_ms: f64, meters: Arc<Meters>) -> Result<P
             return;
         }
         let mut waits = 0;
+        let mut packets = 0u32;
         while !stop.load(Relaxed) {
             if event.wait_for_event(100).is_err() {
                 waits += 1;
@@ -150,6 +151,11 @@ pub fn open_capture(name: &str, period_ms: f64, meters: Arc<Meters>) -> Result<P
             match capture.read_from_device(&mut bytes) {
                 Ok((n, info)) => {
                     let n = n as usize;
+                    // o primeiro pacote sempre vem marcado (começo do fluxo); depois, cada marca é um buraco
+                    packets = packets.saturating_add(1);
+                    if info.flags.data_discontinuity && packets > 1 {
+                        meters.in_glitches.fetch_add(1, Relaxed);
+                    }
                     samples.clear();
                     if info.flags.silent {
                         samples.resize(n * channels, 0.0);
@@ -177,8 +183,9 @@ pub fn open_capture(name: &str, period_ms: f64, meters: Arc<Meters>) -> Result<P
 ///
 /// O mesmo dongle, no exclusivo, às vezes abre pedindo 18 mil amostras/s em vez de 48 mil (com período de 10 ms,
 /// 32 mil): toca buracos e repetições, som incompreensível (31/10, medido com `--teste-motor`). Por isso a thread
-/// mede o ritmo dos pedidos logo depois de o fone acordar e, se fugir mais de 3%, troca sozinha para o
-/// compartilhado no mesmo dispositivo, sem parar a entrada; `meters.out_fallback` guarda a taxa que o fone pediu.
+/// mede o ritmo dos pedidos logo depois de o fone acordar. O defeito é sorteado a cada abertura (01/11: 2 de 6), então
+/// ela reabre o fone no exclusivo até duas vezes; se continuar errado, troca para o compartilhado no mesmo
+/// dispositivo, sem parar a entrada. `meters.out_fallback` guarda a taxa que o fone pediu.
 pub fn open_render(name: &str, rate: u32, period_ms: f64, meters: Arc<Meters>) -> Result<Pending<RenderFn>, String> {
     let name = name.to_owned();
     spawn("áudio-saída", move |info_tx, start_rx: Receiver<RenderFn>, stop| {
@@ -200,7 +207,38 @@ pub fn open_render(name: &str, rate: u32, period_ms: f64, meters: Arc<Meters>) -
 
         let _mmcss = Mmcss::pro_audio();
         let nominal = fmt.get_samplespersec() as f64;
-        match render_loop(&client, &fmt, true, &stop, &meters, &mut callback) {
+        let mut client = client;
+        let mut outcome = render_loop(&client, &fmt, true, &stop, &meters, &mut callback);
+        for attempt in 1..=REOPEN_TRIES {
+            let Ok(Some(asked)) = outcome else { break };
+            log::warn!("saída exclusiva: o dispositivo pediu {asked:.0} amostras/s em vez de {nominal:.0}; reabrindo ({attempt}ª vez)");
+            let _ = client.stop_stream();
+            drop(client);
+            match init_exclusive(&dev, Direction::Render, &[fmt.get_samplespersec()], &[fmt.get_nchannels()], period_ms) {
+                Ok((c, f, _)) if f.get_samplespersec() == fmt.get_samplespersec() && f.get_nchannels() == fmt.get_nchannels() => {
+                    client = c;
+                    outcome = render_loop(&client, &fmt, true, &stop, &meters, &mut callback);
+                }
+                other => {
+                    if let Err(e) = other {
+                        log::warn!("saída exclusiva não reabriu: {e}");
+                    }
+                    // sem o exclusivo de novo: segue para o compartilhado com a taxa errada que ele pediu
+                    match dev.get_iaudioclient() {
+                        Ok(c) => client = c,
+                        Err(e) => {
+                            log::error!("saída: {e}");
+                            meters.device_error.store(true, Relaxed);
+                            meters.out_queue.store(0, Relaxed);
+                            return;
+                        }
+                    }
+                    outcome = Ok(Some(asked));
+                    break;
+                }
+            }
+        }
+        match outcome {
             Ok(Some(asked)) => {
                 log::warn!("saída exclusiva: o dispositivo pediu {asked:.0} amostras/s em vez de {nominal:.0}; passando para o compartilhado");
                 let _ = client.stop_stream();
@@ -296,8 +334,12 @@ fn render_loop(
             if let Some(since) = since {
                 asked += want as u64;
                 let t = since.elapsed().as_secs_f64();
+                let rate = asked as f64 / t;
+                // o defeito do JBL erra por 33 a 62%: um quarto de segundo já mostra, e cada tentativa toca menos lixo
+                if t >= 0.25 && (rate / nominal - 1.0).abs() > 0.15 {
+                    return Ok(Some(rate));
+                }
                 if t >= 1.0 {
-                    let rate = asked as f64 / t;
                     log::info!("saída exclusiva conferida: {rate:.0} amostras/s (devia ser {nominal:.0})");
                     if (rate / nominal - 1.0).abs() > 0.03 {
                         return Ok(Some(rate));
@@ -311,6 +353,9 @@ fn render_loop(
     }
     Ok(None)
 }
+
+/// Quantas vezes a saída exclusiva é reaberta quando o dispositivo pede a taxa errada, antes do compartilhado.
+const REOPEN_TRIES: u32 = 2;
 
 fn find_device(name: &str, dir: Direction) -> Result<Device, WasapiError> {
     DeviceEnumerator::new()?.get_device_collection(&dir)?.get_device_with_name(name)

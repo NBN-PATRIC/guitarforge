@@ -30,6 +30,7 @@ pub const BOOST: Color32 = Color32::from_rgb(0xff, 0x5f, 0x7e);
 pub const PHASER: Color32 = Color32::from_rgb(0xff, 0x8f, 0xc8);
 pub const FLANGER: Color32 = Color32::from_rgb(0xd9, 0x9b, 0xff);
 pub const TREMOLO: Color32 = Color32::from_rgb(0x9b, 0xe3, 0x7a);
+pub const SPREAD: Color32 = Color32::from_rgb(0xb8, 0xe6, 0xff);
 
 /// Tema escuro fixo. As cores ficam todas aqui para a fase "personalizável".
 pub fn apply(ctx: &Context) {

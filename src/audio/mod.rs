@@ -23,15 +23,19 @@ pub struct Devices {
     pub outputs: Vec<String>,
 }
 
+/// Dispositivos de um lado. O `input_devices` e o `output_devices` do cpal testam formato por formato de cada
+/// dispositivo, e o driver do JBL Quantum910 (saída Game) leva 5 s para responder: com ele escolhido, o som
+/// demorava 7 s para começar e o diálogo de áudio congelava a tela 5 s (medido em 01/11). O formato padrão
+/// responde em menos de 1 ms e basta para saber de que lado o dispositivo está.
+fn devices_of(host: &cpal::Host, input: bool) -> Vec<cpal::Device> {
+    let side = |d: &cpal::Device| if input { d.default_input_config().is_ok() } else { d.default_output_config().is_ok() };
+    host.devices().map(|it| it.filter(side).collect()).unwrap_or_default()
+}
+
 pub fn list_devices() -> Devices {
     let host = cpal::default_host();
-    let names = |it: Option<Vec<cpal::Device>>| -> Vec<String> {
-        it.unwrap_or_default().iter().filter_map(|d| d.name().ok()).collect()
-    };
-    Devices {
-        inputs: names(host.input_devices().ok().map(|d| d.collect())),
-        outputs: names(host.output_devices().ok().map(|d| d.collect())),
-    }
+    let names = |list: Vec<cpal::Device>| -> Vec<String> { list.iter().filter_map(|d| d.name().ok()).collect() };
+    Devices { inputs: names(devices_of(&host, true)), outputs: names(devices_of(&host, false)) }
 }
 
 /// `--teste-motor`: liga o motor mudo (nada chega ao fone) e mede blocos, fila, atraso e falhas.
@@ -49,6 +53,7 @@ pub fn engine_test(seconds: u64, exclusive: Exclusive, latency: LatencyMode, out
     // a partida descarta a sobra do anel uma vez e o anel acha a folga dele: mede só o regime
     std::thread::sleep(std::time::Duration::from_secs(1));
     meters.underruns.store(0, Relaxed);
+    meters.in_glitches.store(0, Relaxed);
     meters.ring_drops.store(0, Relaxed);
     let (t0, f0) = (std::time::Instant::now(), meters.out_frames.load(Relaxed));
     let mut lat = Vec::new();
@@ -75,11 +80,12 @@ pub fn engine_test(seconds: u64, exclusive: Exclusive, latency: LatencyMode, out
     );
     let _ = writeln!(
         out,
-        "atraso do app: mínimo {:.1} ms, mediana {:.1} ms, máximo {:.1} ms; falhas {}; descartadas {}; erro de dispositivo {}",
+        "atraso do app: mínimo {:.1} ms, mediana {:.1} ms, máximo {:.1} ms; falhas {}; buracos na entrada {}; descartadas {}; erro de dispositivo {}",
         lat[0],
         lat[lat.len() / 2],
         lat[lat.len() - 1],
         meters.underruns.load(Relaxed),
+        meters.in_glitches.load(Relaxed),
         meters.ring_drops.load(Relaxed),
         meters.device_error.load(Relaxed)
     );
@@ -91,16 +97,16 @@ pub fn describe() -> String {
     let host = cpal::default_host();
     let mut out = String::new();
     let _ = writeln!(out, "Host de áudio: {:?}", host.id());
-    if let Ok(devs) = host.input_devices() {
+    {
         let _ = writeln!(out, "\nEntradas:");
-        for d in devs {
+        for d in devices_of(&host, true) {
             let cfg = d.default_input_config().map(|c| format!("{} ch, {} Hz, {:?}", c.channels(), c.sample_rate().0, c.sample_format()));
             let _ = writeln!(out, "  {} -> {}", d.name().unwrap_or_default(), cfg.unwrap_or_else(|e| e.to_string()));
         }
     }
-    if let Ok(devs) = host.output_devices() {
+    {
         let _ = writeln!(out, "\nSaídas:");
-        for d in devs {
+        for d in devices_of(&host, false) {
             let cfg = d.default_output_config().map(|c| format!("{} ch, {} Hz, {:?}", c.channels(), c.sample_rate().0, c.sample_format()));
             let _ = writeln!(out, "  {} -> {}", d.name().unwrap_or_default(), cfg.unwrap_or_else(|e| e.to_string()));
         }
@@ -112,18 +118,18 @@ pub fn is_rocksmith(name: &str) -> bool {
     name.to_lowercase().contains("rocksmith")
 }
 
-fn find_device(devices: impl Iterator<Item = cpal::Device>, wanted: impl Fn(&str) -> bool) -> Option<cpal::Device> {
+fn find_device(devices: Vec<cpal::Device>, wanted: impl Fn(&str) -> bool) -> Option<cpal::Device> {
     devices.into_iter().find(|d| d.name().map(|n| wanted(&n)).unwrap_or(false))
 }
 
 fn pick_input(host: &cpal::Host, preferred: Option<&str>) -> Result<cpal::Device> {
     if let Some(p) = preferred {
-        if let Some(d) = find_device(host.input_devices()?, |n| n == p) {
+        if let Some(d) = find_device(devices_of(host, true), |n| n == p) {
             return Ok(d);
         }
         log::warn!("entrada '{p}' não encontrada, procurando o cabo Rocksmith");
     }
-    if let Some(d) = find_device(host.input_devices()?, is_rocksmith) {
+    if let Some(d) = find_device(devices_of(host, true), is_rocksmith) {
         return Ok(d);
     }
     host.default_input_device().context("nenhum dispositivo de entrada de áudio")
@@ -131,7 +137,7 @@ fn pick_input(host: &cpal::Host, preferred: Option<&str>) -> Result<cpal::Device
 
 fn pick_output(host: &cpal::Host, preferred: Option<&str>) -> Result<cpal::Device> {
     if let Some(p) = preferred {
-        if let Some(d) = find_device(host.output_devices()?, |n| n == p) {
+        if let Some(d) = find_device(devices_of(host, false), |n| n == p) {
             return Ok(d);
         }
         log::warn!("saída '{p}' não encontrada, usando a padrão do Windows");
@@ -163,7 +169,7 @@ pub struct Engine {
     _input: Stream,
     _output: Stream,
     pub info: EngineInfo,
-    settings_tx: Sender<Settings>,
+    settings_tx: Sender<(Settings, bool)>,
     ir_tx: Sender<Option<Box<Convolver>>>,
     trash_rx: Receiver<Box<Convolver>>,
     rec_rx: Option<rtrb::Consumer<f32>>,
@@ -225,9 +231,11 @@ impl Engine {
         let (settings_tx, settings_rx) = crossbeam_channel::bounded(64);
         let (ir_tx, ir_rx) = crossbeam_channel::bounded(4);
         let (trash_tx, trash_rx) = crossbeam_channel::bounded(4);
-        let (out_prod, out_cons) = rtrb::RingBuffer::new(rate as usize / 2);
+        // os dois lados intercalados: meio segundo de som
+        let (out_prod, out_cons) = rtrb::RingBuffer::new(rate as usize);
         let (an_prod, an_cons) = rtrb::RingBuffer::new(rate as usize / 2);
-        let (rec_prod, rec_cons) = rtrb::RingBuffer::new(rate as usize * 4);
+        // seco, esquerdo e direito: dois segundos
+        let (rec_prod, rec_cons) = rtrb::RingBuffer::new(rate as usize * 6);
         let (tap_prod, tap_cons) = rtrb::RingBuffer::new(out_rate as usize / 2);
 
         crate::analysis::spawn(an_cons, rate as f32, meters.clone());
@@ -242,6 +250,7 @@ impl Engine {
             rec: rec_prod,
             meters: meters.clone(),
             mono: Vec::with_capacity(16384),
+            right: Vec::with_capacity(16384),
             dry: Vec::with_capacity(16384),
             channels: in_channels,
             last: None,
@@ -252,8 +261,8 @@ impl Engine {
             nominal: ratio,
             ratio,
             frac: 1.0,
-            a: 0.0,
-            b: 0.0,
+            a: [0.0; 2],
+            b: [0.0; 2],
             priming: true,
             fill_avg: 0.0,
             margin: latency.margin_blocks(),
@@ -309,8 +318,9 @@ impl Engine {
         })
     }
 
-    pub fn send_settings(&self, s: Settings) -> bool {
-        self.settings_tx.try_send(s).is_ok()
+    /// `switch` = troca de preset: a cadeia passa por um silêncio curto em vez de mudar tudo no meio da nota.
+    pub fn send_settings(&self, s: Settings, switch: bool) -> bool {
+        self.settings_tx.try_send((s, switch)).is_ok()
     }
 
     pub fn send_ir(&self, conv: Option<Box<Convolver>>) {
@@ -424,14 +434,16 @@ where
 
 struct InputSide {
     chain: SignalChain,
-    settings_rx: Receiver<Settings>,
+    settings_rx: Receiver<(Settings, bool)>,
     ir_rx: Receiver<Option<Box<Convolver>>>,
     trash_tx: Sender<Box<Convolver>>,
     out: rtrb::Producer<f32>,
     analysis: rtrb::Producer<f32>,
     rec: rtrb::Producer<f32>,
     meters: Arc<Meters>,
+    /// O som do cabo; depois da cadeia, o lado esquerdo.
     mono: Vec<f32>,
+    right: Vec<f32>,
     dry: Vec<f32>,
     channels: usize,
     last: Option<std::time::Instant>,
@@ -443,21 +455,24 @@ impl InputSide {
         T: SizedSample,
         f32: FromSample<T>,
     {
+        crate::dsp::flush_denormals();
         let started = std::time::Instant::now();
         if let Some(prev) = self.last.replace(started) {
             self.meters.in_gap_max_us.fetch_max(started.duration_since(prev).as_micros() as u32, Relaxed);
         }
-        let mut latest = None;
-        while let Ok(s) = self.settings_rx.try_recv() {
+        let (mut latest, mut switch) = (None, false);
+        while let Ok((s, sw)) = self.settings_rx.try_recv() {
             latest = Some(s);
+            switch |= sw;
         }
         if let Some(s) = latest {
-            self.chain.apply(&s);
+            self.chain.apply(&s, switch);
         }
-        while let Ok(conv) = self.ir_rx.try_recv() {
-            if let Some(old) = self.chain.cabinet.swap_convolver(conv) {
-                let _ = self.trash_tx.try_send(old);
-            }
+        // um IR por vez: a troca espera o som abaixar; o próximo fica no canal
+        if !self.chain.ir_queued()
+            && let Ok(conv) = self.ir_rx.try_recv()
+        {
+            self.chain.queue_ir(conv);
         }
 
         self.mono.clear();
@@ -483,25 +498,33 @@ impl InputSide {
         }
 
         self.chain.set_mains(self.meters.mains_hz.get());
-        self.chain.process(&mut self.mono);
+        self.right.clear();
+        self.right.resize(self.mono.len(), 0.0);
+        self.chain.process_stereo(&mut self.mono, &mut self.right);
+        if let Some(old) = self.chain.take_old_ir() {
+            let _ = self.trash_tx.try_send(old);
+        }
         self.meters.gate_auto_db.set(self.chain.auto_threshold_db.unwrap_or(-120.0));
         self.meters.gate_open.store(self.chain.gate_open(), Relaxed);
 
-        for &v in &self.mono {
-            if self.out.push(v).is_err() {
+        for (&l, &r) in self.mono.iter().zip(&self.right) {
+            if self.out.slots() < 2 {
                 break;
             }
+            let _ = self.out.push(l);
+            let _ = self.out.push(r);
         }
 
         if recording {
             let mut dropped = 0;
-            for (&d, &w) in self.dry.iter().zip(&self.mono) {
-                if self.rec.slots() < 2 {
+            for ((&d, &l), &r) in self.dry.iter().zip(&self.mono).zip(&self.right) {
+                if self.rec.slots() < 3 {
                     dropped += 1;
                     continue;
                 }
                 let _ = self.rec.push(d);
-                let _ = self.rec.push(w);
+                let _ = self.rec.push(l);
+                let _ = self.rec.push(r);
             }
             if dropped > 0 {
                 self.meters.rec_dropped.fetch_add(dropped, Relaxed);
@@ -518,8 +541,9 @@ struct OutputSide {
     nominal: f64,
     ratio: f64,
     frac: f64,
-    a: f32,
-    b: f32,
+    /// Quadros (esquerdo, direito) entre os quais a saída interpola.
+    a: [f32; 2],
+    b: [f32; 2],
     priming: bool,
     fill_avg: f32,
     margin: f32,
@@ -538,7 +562,8 @@ impl OutputSide {
         T: SizedSample + FromSample<f32>,
     {
         let silence = T::from_sample(0.0f32);
-        let frames = data.len() / self.channels.max(1);
+        let channels = self.channels.max(1);
+        let frames = data.len() / channels;
         self.meters.out_block.store(frames as u32, Relaxed);
         let in_block = self.meters.in_block.load(Relaxed).max(64) as f32;
         let need = (frames as f64 * self.ratio).ceil() as f32;
@@ -547,7 +572,8 @@ impl OutputSide {
             self.jitter = self.jitter_max * 0.1;
         }
         let target = need + in_block * self.margin + self.jitter;
-        let avail = self.ring.slots();
+        // o anel leva os dois lados intercalados: o nível conta em quadros (um par esquerdo e direito)
+        let avail = self.ring.slots() / 2;
         self.meters.ring_fill.store(avail as u32, Relaxed);
 
         if self.priming {
@@ -567,30 +593,33 @@ impl OutputSide {
         let max_fill = (target + 2.0 * in_block.max(need)) as usize;
         if avail > max_fill {
             let excess = avail - target as usize;
-            if let Ok(chunk) = self.ring.read_chunk(excess) {
+            if let Ok(chunk) = self.ring.read_chunk(excess * 2) {
                 chunk.commit_all();
                 self.meters.ring_drops.fetch_add(excess as u32, Relaxed);
             }
         }
 
-        self.fill_avg += 0.02 * (self.ring.slots() as f32 - self.fill_avg);
+        self.fill_avg += 0.02 * ((self.ring.slots() / 2) as f32 - self.fill_avg);
         let err = ((self.fill_avg - target) / target).clamp(-1.0, 1.0) as f64;
         self.ratio = self.nominal * (1.0 + 0.003 * err);
 
         let mut peak = 0.0f32;
-        for frame in data.chunks_mut(self.channels.max(1)) {
+        for frame in data.chunks_mut(channels) {
             if !self.priming {
                 while self.frac >= 1.0 {
-                    match self.ring.pop() {
-                        Ok(v) => {
+                    // o par inteiro ou nada: a entrada pode estar no meio de escrever o direito
+                    match self.ring.read_chunk(2) {
+                        Ok(chunk) => {
+                            let mut pair = chunk.into_iter();
+                            let (l, r) = (pair.next().unwrap_or(0.0), pair.next().unwrap_or(0.0));
                             self.a = self.b;
-                            self.b = v;
+                            self.b = [l, r];
                             self.frac -= 1.0;
                         }
                         Err(_) => {
                             self.priming = true;
-                            self.a = 0.0;
-                            self.b = 0.0;
+                            self.a = [0.0; 2];
+                            self.b = [0.0; 2];
                             self.frac = 1.0;
                             self.meters.underruns.fetch_add(1, Relaxed);
                             self.jitter = (self.jitter + in_block).min(self.jitter_max);
@@ -604,14 +633,23 @@ impl OutputSide {
                 let _ = self.tap.push(0.0);
                 continue;
             }
-            let v = self.a + (self.b - self.a) * self.frac as f32;
-            let _ = self.tap.push(v);
+            let t = self.frac as f32;
+            let l = self.a[0] + (self.b[0] - self.a[0]) * t;
+            let r = self.a[1] + (self.b[1] - self.a[1]) * t;
+            let _ = self.tap.push(l);
             self.frac += self.ratio;
-            peak = peak.max(v.abs());
-            // só frente esquerda e direita: em saída 5.1/7.1 (headset JBL abre com 8) o resto fica mudo
-            let t = T::from_sample(v);
-            for (i, out) in frame.iter_mut().enumerate() {
-                *out = if i < 2 { t } else { silence };
+            peak = peak.max(l.abs()).max(r.abs());
+            if channels == 1 {
+                frame[0] = T::from_sample(0.5 * (l + r));
+            } else {
+                // só frente esquerda e direita: em saída 5.1/7.1 (headset JBL abre com 8) o resto fica mudo
+                for (i, out) in frame.iter_mut().enumerate() {
+                    *out = match i {
+                        0 => T::from_sample(l),
+                        1 => T::from_sample(r),
+                        _ => silence,
+                    };
+                }
             }
         }
         self.meters.out_peak.raise(peak);
@@ -630,8 +668,8 @@ mod tests {
             nominal: ratio,
             ratio,
             frac: 1.0,
-            a: 0.0,
-            b: 0.0,
+            a: [0.0; 2],
+            b: [0.0; 2],
             priming: true,
             fill_avg: 0.0,
             margin: 1.0,
@@ -655,7 +693,9 @@ mod tests {
         for step in 0..300 {
             for _ in 0..480 {
                 let t = n_in as f32 / 48000.0;
-                let _ = prod.push((2.0 * PI * 1000.0 * t).sin() * 0.5);
+                let v = (2.0 * PI * 1000.0 * t).sin() * 0.5;
+                let _ = prod.push(v);
+                let _ = prod.push(v);
                 n_in += 1;
             }
             let mut buf = vec![0.0f32; 441 * 2];
@@ -680,6 +720,7 @@ mod tests {
         // entrada 0,1% mais rápida que a saída: 481 amostras a cada 480 lidas
         for _ in 0..3000 {
             for _ in 0..481 {
+                let _ = prod.push(0.1);
                 let _ = prod.push(0.1);
             }
             let mut buf = vec![0.0f32; 480 * 2];
