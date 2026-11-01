@@ -4,8 +4,10 @@ pub mod cabinet;
 pub mod effects;
 pub mod hum_filter;
 pub mod hum_meter;
+pub mod loudness;
 pub mod noise_gate;
 pub mod oversample;
+pub mod room;
 pub mod tuner;
 
 use crate::settings::Settings;
@@ -315,10 +317,20 @@ impl SignalChain {
         self.old_ir.take()
     }
 
+    /// Sala por convolução nova (ou nenhuma); entra em transição com a de agora. Devolve uma para liberar já.
+    pub fn swap_room(&mut self, room: Option<Box<room::RoomConvolver>>) -> Option<Box<room::RoomConvolver>> {
+        self.reverb.swap_room(room)
+    }
+
+    /// Sala que terminou a transição, para ser liberada fora da thread de áudio.
+    pub fn take_retired_room(&mut self) -> Option<Box<room::RoomConvolver>> {
+        self.reverb.take_retired_room()
+    }
+
     fn apply_now(&mut self, s: &Settings) {
         self.current = *s;
         self.input_gain.target = db_to_lin(s.input_gain_db);
-        self.master.target = if s.mute { 0.0 } else { s.master * s.master };
+        self.master.target = if s.mute { 0.0 } else { s.master * s.master * db_to_lin(s.level_db) };
 
         self.hum_fade.set(s.gate.hum_filter);
         self.gate_fade.set(s.gate.on);
@@ -377,6 +389,7 @@ impl SignalChain {
             self.reverb.clear();
         }
         self.reverb.set(s.reverb.size, s.reverb.mix);
+        self.reverb.set_room(s.reverb.kind.is_convolution(), s.reverb.pre_delay_ms, self.sample_rate);
     }
 
     pub fn set_mains(&mut self, hz: f32) {

@@ -78,7 +78,7 @@ fn voicing(sr: f32, kind: CabKind) -> [Biquad; 5] {
     }
 }
 
-/// IR de gabinete lido de um WAV (qualquer taxa, 16/24/32 bits ou float; usa o 1º canal).
+/// IR lido de um WAV (qualquer taxa, 16/24/32 bits ou float). O gabinete usa o 1º canal; a sala usa os dois.
 pub struct ImpulseResponse {
     pub name: String,
     /// Onde o usuário escolheu o arquivo (o diálogo abre ali da próxima vez).
@@ -86,6 +86,8 @@ pub struct ImpulseResponse {
     /// Nome da cópia na pasta de IRs do app (o que o preset guarda).
     pub stored: Option<String>,
     samples: Vec<f32>,
+    /// 2º canal, se o arquivo for estéreo (IR de sala).
+    right: Option<Vec<f32>>,
     rate: u32,
 }
 
@@ -119,11 +121,12 @@ impl ImpulseResponse {
             }
         };
         let samples: Vec<f32> = raw.chunks(channels).map(|frame| frame[0]).collect();
+        let right = (channels >= 2).then(|| raw.chunks(channels).map(|frame| frame[1]).collect());
         if samples.is_empty() {
             bail!("o arquivo não tem áudio");
         }
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        Ok(Self { name, path: path.to_path_buf(), stored: None, samples, rate: spec.sample_rate })
+        Ok(Self { name, path: path.to_path_buf(), stored: None, samples, right, rate: spec.sample_rate })
     }
 
     /// Lê o WAV escolhido e guarda uma cópia em `dir` (nome pelo conteúdo). Mover, renomear ou apagar o original
@@ -184,6 +187,14 @@ impl ImpulseResponse {
 
     pub fn convolver(&self, rate: u32) -> Box<Convolver> {
         Box::new(Convolver::new(&self.prepare(rate)))
+    }
+
+    /// Os dois lados na taxa do motor, sem corte nem ajuste de nível (mono: o mesmo nos dois).
+    pub fn stereo(&self, rate: u32) -> (Vec<f32>, Vec<f32>) {
+        let conv = |x: &Vec<f32>| if self.rate == rate { x.clone() } else { resample_linear(x, self.rate as f64 / rate as f64) };
+        let left = conv(&self.samples);
+        let right = self.right.as_ref().map_or_else(|| left.clone(), conv);
+        (left, right)
     }
 }
 

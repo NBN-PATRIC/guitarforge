@@ -312,17 +312,56 @@ impl Default for DelayCfg {
     }
 }
 
+/// De onde vem a ambiência: o reverb por algoritmo (leve, com o knob Sala), uma sala de fábrica por convolução
+/// (IR gerado pelo app) ou o IR de sala de um arquivo.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ReverbKind {
+    #[default]
+    Algorithm,
+    SmallRoom,
+    Studio,
+    Room,
+    Hall,
+    Church,
+    File,
+}
+
+impl ReverbKind {
+    /// As salas de fábrica (convolução com IR gerado), da menor para a maior.
+    pub const ROOMS: [ReverbKind; 5] = [Self::SmallRoom, Self::Studio, Self::Room, Self::Hall, Self::Church];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Algorithm => "Algoritmo",
+            Self::SmallRoom => "Quarto",
+            Self::Studio => "Estúdio",
+            Self::Room => "Sala",
+            Self::Hall => "Salão",
+            Self::Church => "Igreja",
+            Self::File => "IR de arquivo",
+        }
+    }
+
+    pub fn is_convolution(self) -> bool {
+        self != Self::Algorithm
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReverbCfg {
     pub on: bool,
+    /// Tamanho do reverb por algoritmo.
     pub size: f32,
     pub mix: f32,
+    pub kind: ReverbKind,
+    /// Atraso antes da sala por convolução (0 a 150 ms).
+    pub pre_delay_ms: f32,
 }
 
 impl Default for ReverbCfg {
     fn default() -> Self {
-        Self { on: true, size: 0.5, mix: 0.2 }
+        Self { on: true, size: 0.5, mix: 0.2, kind: ReverbKind::Algorithm, pre_delay_ms: 0.0 }
     }
 }
 
@@ -332,6 +371,8 @@ pub struct Settings {
     pub input_gain_db: f32,
     pub master: f32,
     pub mute: bool,
+    /// Compensação de volume do preset (volume igual entre presets), antes do volume geral.
+    pub level_db: f32,
     pub gate: GateCfg,
     pub comp: CompCfg,
     pub wah: WahCfg,
@@ -356,6 +397,7 @@ impl Default for Settings {
             input_gain_db: 0.0,
             master: 0.6,
             mute: false,
+            level_db: 0.0,
             gate: GateCfg::default(),
             comp: CompCfg::default(),
             wah: WahCfg::default(),

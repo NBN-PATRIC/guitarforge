@@ -16,6 +16,9 @@ pub struct Preset {
     pub ir_path: Option<String>,
     /// Cópia do IR na pasta de IRs do app (`%APPDATA%\GuitarForge\irs`).
     pub ir_file: Option<String>,
+    /// O mesmo para o IR de sala do reverb (`ReverbKind::File`).
+    pub room_ir_path: Option<String>,
+    pub room_ir_file: Option<String>,
     /// Afinação do preset (id de `Tuning::id`): carregar o som de uma música já troca o afinador.
     pub tuning: Option<String>,
     #[serde(skip)]
@@ -24,7 +27,16 @@ pub struct Preset {
 
 impl Default for Preset {
     fn default() -> Self {
-        Self { name: "Sem nome".into(), settings: Settings::default(), ir_path: None, ir_file: None, tuning: None, factory: false }
+        Self {
+            name: "Sem nome".into(),
+            settings: Settings::default(),
+            ir_path: None,
+            ir_file: None,
+            room_ir_path: None,
+            room_ir_file: None,
+            tuning: None,
+            factory: false,
+        }
     }
 }
 
@@ -43,7 +55,7 @@ impl Preset {
 fn make(name: &str, edit: impl FnOnce(&mut Settings)) -> Preset {
     let mut s = Settings::default();
     edit(&mut s);
-    Preset { name: name.into(), settings: s, ir_path: None, ir_file: None, tuning: None, factory: true }
+    Preset { name: name.into(), settings: s, factory: true, ..Preset::default() }
 }
 
 pub fn factory() -> Vec<Preset> {
@@ -356,6 +368,8 @@ pub struct AppState {
     pub oversample: Oversample,
     pub tuning: String,
     pub notation: Notation,
+    /// Volume igual entre presets: ao carregar, cada preset é medido e compensado (`dsp::loudness`).
+    pub level_presets: bool,
 }
 
 impl Default for AppState {
@@ -369,6 +383,7 @@ impl Default for AppState {
             oversample: Oversample::default(),
             tuning: Tuning::default().id(),
             notation: Notation::Solfege,
+            level_presets: true,
         }
     }
 }

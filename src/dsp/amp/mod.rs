@@ -45,10 +45,12 @@ impl AmpSim {
 
     pub fn set(&mut self, c: &AmpCfg) {
         let sr = self.sr;
+        // ganho final de cada canal: com os knobs no padrão os três soam iguais (medido com o acorde de referência,
+        // teste `amp_channels_sound_equally_loud`); até a v0.4 o Lead saía 12 dB acima do Limpo
         let (hp_hz, gain_db, bias, two_stages, out_gain) = match c.channel {
-            AmpChannel::Clean => (40.0, -6.0 + c.gain * 18.0, 0.0, false, 1.6),
+            AmpChannel::Clean => (40.0, -6.0 + c.gain * 18.0, 0.0, false, 3.3),
             AmpChannel::Crunch => (90.0, 6.0 + c.gain * 24.0, 0.12, false, 1.0),
-            AmpChannel::Lead => (130.0, 14.0 + c.gain * 26.0, 0.18, true, 0.85),
+            AmpChannel::Lead => (130.0, 14.0 + c.gain * 26.0, 0.18, true, 0.43),
         };
         self.input_hp.retune(Biquad::highpass(sr, hp_hz, 0.707));
         self.pre_lp.retune(Biquad::lowpass(sr, 9000.0, 0.707));

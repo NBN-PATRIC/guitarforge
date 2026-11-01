@@ -42,12 +42,12 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(i) = args.iter().position(|a| a == "--print") {
-        // --print arquivo.bmp [largura altura] [fim]
+        // --print arquivo.bmp [largura altura] [fim|audio|aviso]: fim rola até o fim, audio abre o diálogo Áudio…,
+        // aviso mostra a faixa da saída exclusiva com programas de exemplo
         let path = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("uso: --print arquivo.bmp [largura altura]"))?;
         let w = args.get(i + 2).and_then(|v| v.parse().ok()).unwrap_or(1220.0);
         let h = args.get(i + 3).and_then(|v| v.parse().ok()).unwrap_or(860.0);
-        let bottom = args.get(i + 4).is_some_and(|v| v == "fim");
-        return gui::print(path.into(), [w, h], bottom);
+        return gui::print(path.into(), [w, h], args.get(i + 4).cloned());
     }
     if let Some(i) = args.iter().position(|a| a == "--diagnostico") {
         // --diagnostico segundos [entrada|saida|ambos|nenhum] [baixa|normal|segura] [1|2|4] pasta

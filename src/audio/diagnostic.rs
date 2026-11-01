@@ -36,6 +36,13 @@ pub fn run(seconds: u64, exclusive: Exclusive, latency: LatencyMode, oversample:
     if let Some(ir) = &ir {
         engine.send_ir(Some(ir.convolver(engine.info.rate)));
     }
+    let room_ir = ImpulseResponse::for_preset(
+        state.preset.room_ir_file.as_deref(),
+        state.preset.room_ir_path.as_deref(),
+        &crate::paths::irs_dir(),
+    )
+    .and_then(|r| r.ok());
+    engine.send_room(crate::dsp::room::build(settings.reverb.kind, room_ir.as_ref(), engine.info.rate));
     let (rate, out_rate) = (engine.info.rate, engine.info.out_rate);
     let mut out = format!(
         "{} ({rate} Hz, exclusivo {}) -> {} ({out_rate} Hz, exclusivo {}); latência {latency:?}, sobreamostragem {oversample:?}; preset {}\n",
@@ -104,6 +111,7 @@ pub fn run(seconds: u64, exclusive: Exclusive, latency: LatencyMode, oversample:
     if let Some(ir) = &ir {
         chain.cabinet.swap_convolver(Some(ir.convolver(rate)));
     }
+    chain.swap_room(crate::dsp::room::build(settings.reverb.kind, room_ir.as_ref(), rate));
     let mut offline = dry.clone();
     let mut offline_right = vec![0.0; offline.len()];
     let block = (meters.in_block.load(Relaxed) as usize).max(32);

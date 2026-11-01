@@ -14,12 +14,13 @@ use eframe::egui::{
 use crate::audio::recorder::{self, Recording};
 use crate::audio::{self, Engine};
 use crate::dsp::cabinet::ImpulseResponse;
-use crate::dsp::lin_to_db;
+use crate::dsp::{lin_to_db, loudness};
+use crate::dsp::room;
 use crate::dsp::tuner::{self, Instrument, Tuning};
 use crate::meters::Meters;
 use crate::paths;
 use crate::preset::{self, AppState, Exclusive, LatencyMode, Oversample, Preset};
-use crate::settings::{AmpChannel, CabKind, DriveKind, EQ_FREQS, Settings};
+use crate::settings::{AmpChannel, CabKind, DriveKind, EQ_FREQS, ReverbKind, Settings};
 use widgets::{KNOB_W, Knob, fmt_db, fmt_ms};
 
 /// Largura máxima da coluna de conteúdo: maximizado, o rack fica centralizado em vez de esticar.
@@ -62,7 +63,7 @@ pub fn run(instance: Option<crate::instance::Instance>) -> anyhow::Result<()> {
 
 /// `--print`: abre a janela sem áudio, deixa assentar, grava o que o próprio app desenhou num BMP e fecha.
 /// Serve para conferir o layout sem capturar a tela (que pegaria as janelas de outros programas).
-pub fn print(path: PathBuf, size: [f32; 2], bottom: bool) -> anyhow::Result<()> {
+pub fn print(path: PathBuf, size: [f32; 2], view: Option<String>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("GuitarForge (print)").with_inner_size(size),
         ..Default::default()
@@ -74,7 +75,12 @@ pub fn print(path: PathBuf, size: [f32; 2], bottom: bool) -> anyhow::Result<()> 
             theme::apply(&cc.egui_ctx);
             let mut app = App::new(false);
             app.print = Some((path, 0));
-            app.print_bottom = bottom;
+            match view.as_deref() {
+                Some("fim") => app.print_bottom = true,
+                Some("audio") => app.open_audio_dialog(),
+                Some("aviso") => app.capture_apps = vec!["OBS", "Discord"],
+                _ => {}
+            }
             Ok(Box::new(app))
         }),
     )
@@ -127,6 +133,16 @@ enum CabAction {
     Remove,
 }
 
+/// O que o cartão Reverb pediu (o IR de sala é carregado fora do desenho).
+enum RoomAction {
+    None,
+    Load,
+    Remove,
+}
+
+/// Sala montada no motor: o tipo e, para `ReverbKind::File`, a cópia do IR.
+type RoomKey = (ReverbKind, Option<String>);
+
 struct App {
     state: AppState,
     baseline: Settings,
@@ -136,8 +152,19 @@ struct App {
     engine: Option<Engine>,
     engine_error: Option<String>,
     devices: audio::Devices,
+    /// Programas de transmissão ou chamada abertos (OBS, Discord...), procurados só com a saída exclusiva, e quando
+    /// foi a última procura (`None`: procurar já).
+    capture_apps: Vec<&'static str>,
+    capture_check: Option<Instant>,
+    /// Os que o "Agora não" do aviso já dispensou nesta sessão; outro programa que abrir avisa de novo.
+    capture_dismissed: Vec<&'static str>,
     ir: Option<ImpulseResponse>,
     ir_error: Option<String>,
+    /// IR de sala carregado (fica à mão mesmo com outra sala escolhida).
+    room_ir: Option<ImpulseResponse>,
+    room_error: Option<String>,
+    /// O que já foi mandado ao motor (`None` = nada ainda; `Some(None)` = reverb por algoritmo, sem sala).
+    room_sent: Option<Option<RoomKey>>,
     recording: Option<Recording>,
     last_recording: Option<PathBuf>,
     rec_error: Option<String>,
@@ -176,6 +203,8 @@ struct App {
     /// Janela estreita (menos de 1200 pontos): a barra de cima encolhe medidores e textos para nada se cobrir
     /// (a 1000, sem áudio, o GRAVAR tapava o botão Áudio…, que é o que se precisa justamente aí).
     compact: bool,
+    /// Altura da bolha de status no quadro anterior, para centralizá-la na barra de cima (ver `status_pill`).
+    pill_h: f32,
     /// `--print`: destino e quadros desenhados até agora.
     print: Option<(PathBuf, u32)>,
     print_bottom: bool,
@@ -193,9 +222,15 @@ impl App {
             meters: Arc::new(Meters::new()),
             engine: None,
             engine_error: None,
-            devices: audio::Devices { inputs: Vec::new(), outputs: Vec::new() },
+            devices: audio::Devices { inputs: Vec::new(), outputs: Vec::new(), default_output: None },
+            capture_apps: Vec::new(),
+            capture_check: None,
+            capture_dismissed: Vec::new(),
             ir: None,
             ir_error: None,
+            room_ir: None,
+            room_error: None,
+            room_sent: None,
             recording: None,
             last_recording: None,
             rec_error: None,
@@ -227,11 +262,16 @@ impl App {
             start_pending: false,
             frames: 0,
             compact: false,
+            pill_h: 48.0,
             last_save: now,
             print: None,
             print_bottom: false,
         };
         app.load_preset_ir();
+        app.load_preset_room();
+        app.level_current();
+        app.baseline = app.state.preset.settings;
+        app.last_seen = app.state.preset.settings;
         app.reset_strings();
         app.start_pending = audio;
         app
@@ -249,6 +289,7 @@ impl App {
         self.stop_recording();
         self.engine = None;
         self.sent = None;
+        self.room_sent = None;
         let settings = self.effective_settings();
         let started = Instant::now();
         let result = Engine::start(
@@ -343,6 +384,96 @@ impl App {
         self.dirty = true;
     }
 
+    /// IR de sala escolhido no diálogo: cópia na mesma pasta dos IRs de gabinete, guardada com o preset.
+    fn load_room_ir(&mut self, path: PathBuf) {
+        match ImpulseResponse::import_into(&path, &paths::irs_dir()) {
+            Ok(ir) => {
+                let r = &mut self.state.preset.settings.reverb;
+                r.on = true;
+                r.kind = ReverbKind::File;
+                self.use_room_ir(ir);
+            }
+            Err(e) => self.room_error = Some(format!("{e:#}")),
+        }
+    }
+
+    fn use_room_ir(&mut self, ir: ImpulseResponse) {
+        self.state.preset.room_ir_path = Some(ir.path.to_string_lossy().into_owned());
+        self.state.preset.room_ir_file = ir.stored.clone();
+        self.room_ir = Some(ir);
+        self.room_error = None;
+        self.dirty = true;
+    }
+
+    fn load_preset_room(&mut self) {
+        let p = &self.state.preset;
+        let Some(result) = ImpulseResponse::for_preset(p.room_ir_file.as_deref(), p.room_ir_path.as_deref(), &paths::irs_dir())
+        else {
+            return;
+        };
+        match result {
+            Ok(ir) => self.use_room_ir(ir),
+            Err(e) => {
+                log::warn!("IR de sala do preset: {e:#}");
+                self.room_ir = None;
+                self.room_error = Some(format!("IR de sala do preset não encontrado ({e:#})"));
+            }
+        }
+    }
+
+    fn pick_room_ir(&mut self) {
+        let mut dialog =
+            rfd::FileDialog::new().set_title("Escolha um IR de sala (reverb)").add_filter("Arquivo WAV", &["wav"]);
+        if let Some(dir) = self.room_ir.as_ref().or(self.ir.as_ref()).and_then(|ir| ir.path.parent().map(|p| p.to_path_buf())) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.load_room_ir(path);
+        }
+    }
+
+    fn remove_room_ir(&mut self) {
+        self.room_ir = None;
+        self.room_error = None;
+        self.state.preset.room_ir_path = None;
+        self.state.preset.room_ir_file = None;
+        let r = &mut self.state.preset.settings.reverb;
+        if r.kind == ReverbKind::File {
+            r.kind = ReverbKind::Room;
+        }
+        self.dirty = true;
+    }
+
+    /// Monta a sala que os ajustes pedem e manda ao motor quando ela muda (tipo ou arquivo). Montar leva de 5 a
+    /// 30 ms, aqui na interface; o áudio só troca o ponteiro e faz a transição.
+    fn sync_room(&mut self) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        let kind = self.state.preset.settings.reverb.kind;
+        let want = match kind {
+            ReverbKind::Algorithm => None,
+            ReverbKind::File => self.room_ir.as_ref().and_then(|ir| ir.stored.clone()).map(|f| (kind, Some(f))),
+            k => Some((k, None)),
+        };
+        if self.room_sent.as_ref() == Some(&want) {
+            return;
+        }
+        let started = Instant::now();
+        let built = want.as_ref().and_then(|(k, _)| room::build(*k, self.room_ir.as_ref(), engine.info.rate));
+        engine.send_room(built);
+        if want.is_some() {
+            log::info!("sala {:?} montada em {} ms", want, started.elapsed().as_millis());
+        }
+        self.room_sent = Some(want);
+    }
+
+    /// Compensação de volume do preset atual (volume igual entre presets), medida agora (uns 20 ms aqui na interface).
+    fn level_current(&mut self) {
+        let s = &mut self.state.preset.settings;
+        s.level_db = if self.state.level_presets { loudness::trim_for(s) } else { 0.0 };
+    }
+
     fn apply_preset(&mut self, mut p: Preset) {
         let current = self.state.preset.settings;
         p.settings.master = current.master;
@@ -350,10 +481,19 @@ impl App {
         p.settings.input_gain_db = current.input_gain_db;
         // a supressão de ruído é do cabo e da guitarra, não do som: não muda com o preset
         p.settings.gate = current.gate;
+        p.settings.level_db = if self.state.level_presets { loudness::trim_for(&p.settings) } else { 0.0 };
         self.baseline = p.settings;
         self.switching = true;
         let has_ir = p.ir_file.is_some() || p.ir_path.is_some();
+        let has_room = p.room_ir_file.is_some() || p.room_ir_path.is_some();
         self.state.preset = p;
+        if has_room {
+            self.load_preset_room();
+        } else {
+            // como no gabinete: o IR de sala carregado fica à mão
+            self.state.preset.room_ir_path = self.room_ir.as_ref().map(|ir| ir.path.to_string_lossy().into_owned());
+            self.state.preset.room_ir_file = self.room_ir.as_ref().and_then(|ir| ir.stored.clone());
+        }
         if has_ir {
             self.load_preset_ir();
         } else {
@@ -439,6 +579,23 @@ impl App {
         });
     }
 
+    /// A saída abriu (e continua) no modo exclusivo: nenhum outro programa toca nem captura nela.
+    fn output_exclusive(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.info.exclusive.output)
+    }
+
+    /// "Liberar": a saída volta ao compartilhado e fica assim (para voltar, Áudio…). Outros programas tornam a
+    /// ouvir e capturar o som do GuitarForge; o atraso sobe uns 10 ms.
+    fn release_output(&mut self) {
+        log::info!("saída exclusiva liberada pelo aviso");
+        self.state.exclusive.output = false;
+        if let Some(d) = &mut self.audio_dialog {
+            d.exclusive.output = false;
+        }
+        self.dirty = true;
+        self.start_engine();
+    }
+
     fn poll(&mut self) {
         let fallback = self.meters.out_fallback.load(Relaxed);
         if let Some(e) = self.engine.as_mut().filter(|e| fallback > 0 && e.info.exclusive.output) {
@@ -479,6 +636,15 @@ impl App {
         }
         if let Some(e) = &self.engine {
             e.collect_trash();
+        }
+        if self.print.is_some() {
+            // --print aviso: a lista de exemplo fica
+        } else if !self.output_exclusive() {
+            self.capture_apps.clear();
+            self.capture_check = None;
+        } else if self.capture_check.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
+            self.capture_check = Some(Instant::now());
+            self.capture_apps = audio::capture_apps::running();
         }
 
         let now = Instant::now();
@@ -609,6 +775,7 @@ impl App {
         } else {
             self.switching = false;
         }
+        self.sync_room();
         if self.state.preset.settings != self.last_seen {
             self.last_seen = self.state.preset.settings;
             self.dirty = true;
@@ -677,6 +844,7 @@ impl eframe::App for App {
         let side = ((ctx.screen_rect().width() - MAX_W) / 2.0).max(MIN_SIDE).floor();
         self.compact = ctx.screen_rect().width() < 1200.0;
         self.top_bar(ctx, side);
+        self.capture_banner(ctx, side);
         self.bottom_bar(ctx, side);
         egui::CentralPanel::default()
             .frame(Frame::none().fill(theme::PANEL).inner_margin(Margin::symmetric(0.0, 12.0)))
@@ -741,59 +909,141 @@ impl App {
     fn status_pill(&mut self, ui: &mut Ui) {
         let mut open_dialog = false;
         let mut retry = false;
-        Frame::none()
-            .fill(theme::CARD)
-            .rounding(Rounding::same(20.0))
-            .inner_margin(Margin::symmetric(14.0, 7.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    match &self.engine {
-                        Some(e) => {
-                            let rocksmith = audio::is_rocksmith(&e.info.input);
-                            let led = widgets::led(ui, true, if rocksmith { theme::GREEN } else { theme::YELLOW });
-                            if !rocksmith {
-                                led.on_hover_text("O cabo Rocksmith não foi encontrado, usando outra entrada.");
+        let mut release = false;
+        // O egui põe um bloco de altura desconhecida pela altura de uma linha, centrado, e deixa crescer para baixo:
+        // a bolha (duas linhas) descia uns 9 px em relação ao GRAVAR. Aqui ela fica numa coluna da altura da barra,
+        // com o espaço de cima calculado pela altura que teve no quadro anterior.
+        let row_h = ui.available_height();
+        let top = ((row_h - self.pill_h) / 2.0).max(0.0);
+        let pill = ui.allocate_ui_with_layout(vec2(ui.available_width(), row_h), Layout::top_down(Align::Min), |ui| {
+            ui.add_space(top);
+            Frame::none()
+                .fill(theme::CARD)
+                .rounding(Rounding::same(20.0))
+                .inner_margin(Margin::symmetric(14.0, 7.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        match &self.engine {
+                            Some(e) => {
+                                let rocksmith = audio::is_rocksmith(&e.info.input);
+                                let led = widgets::led(ui, true, if rocksmith { theme::GREEN } else { theme::YELLOW });
+                                if !rocksmith {
+                                    led.on_hover_text("O cabo Rocksmith não foi encontrado, usando outra entrada.");
+                                }
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(short_name(&e.info.input, if self.compact { 22 } else { 32 })).strong());
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        let exclusive = e.info.exclusive.output;
+                                        let delay = if self.compact && exclusive { "" } else { "atraso do app " };
+                                        ui.label(
+                                            RichText::new(format!("{} · {delay}~{:.0} ms", khz(e.info.rate), e.latency_ms(&self.meters)))
+                                                .small()
+                                                .color(theme::DIM),
+                                        )
+                                        .on_hover_text(format!("Saída: {}", e.info.output));
+                                        if exclusive {
+                                            ui.label(RichText::new("· saída exclusiva").small().color(theme::YELLOW)).on_hover_text(format!(
+                                                "Só o GuitarForge toca em {}. Discord, OBS e o navegador não ouvem nem capturam o som \
+                                                 dele (compartilhar a tela com som sai sem a guitarra), e o som deles nessa saída fica mudo \
+                                                 enquanto o GuitarForge estiver aberto.",
+                                                e.info.output
+                                            ));
+                                            // link do tamanho do texto: um botão aumentava a linha e a bolha
+                                            release = ui
+                                                .add(
+                                                    Label::new(RichText::new("liberar").small().underline().color(theme::TEXT))
+                                                        .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text(RELEASE_HINT)
+                                                .clicked();
+                                        }
+                                    });
+                                });
                             }
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(short_name(&e.info.input, if self.compact { 22 } else { 32 })).strong());
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} · atraso do app ~{:.0} ms",
-                                        khz(e.info.rate),
-                                        e.latency_ms(&self.meters)
-                                    ))
-                                    .small()
-                                    .color(theme::DIM),
-                                )
-                                .on_hover_text(format!("Saída: {}", e.info.output));
-                            });
+                            None if self.start_pending => {
+                                widgets::led(ui, true, theme::YELLOW);
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new("Abrindo o áudio…").strong());
+                                    ui.label(RichText::new("procurando o cabo e a saída").small().color(theme::DIM));
+                                });
+                            }
+                            None => {
+                                widgets::led(ui, true, theme::RED);
+                                let err = self.engine_error.clone().unwrap_or_else(|| "parado".into());
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new("Sem áudio").strong().color(theme::RED));
+                                    let max = if self.compact { 26 } else { 58 };
+                                    ui.label(RichText::new(truncate(&err, max)).small().color(theme::DIM)).on_hover_text(err);
+                                });
+                                retry = ui.button("Tentar de novo").clicked();
+                            }
                         }
-                        None if self.start_pending => {
-                            widgets::led(ui, true, theme::YELLOW);
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new("Abrindo o áudio…").strong());
-                                ui.label(RichText::new("procurando o cabo e a saída").small().color(theme::DIM));
-                            });
-                        }
-                        None => {
-                            widgets::led(ui, true, theme::RED);
-                            let err = self.engine_error.clone().unwrap_or_else(|| "parado".into());
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new("Sem áudio").strong().color(theme::RED));
-                                let max = if self.compact { 26 } else { 58 };
-                                ui.label(RichText::new(truncate(&err, max)).small().color(theme::DIM)).on_hover_text(err);
-                            });
-                            retry = ui.button("Tentar de novo").clicked();
-                        }
-                    }
-                    open_dialog = ui.button("Áudio…").on_hover_text("Escolher entrada, saída e latência").clicked();
-                });
-            });
+                        open_dialog = ui.button("Áudio…").on_hover_text("Escolher entrada, saída e latência").clicked();
+                    });
+                })
+                .response
+                .rect
+                .height()
+        });
+        if (pill.inner - self.pill_h).abs() > 0.5 {
+            self.pill_h = pill.inner;
+            ui.ctx().request_repaint();
+        }
         if retry {
             self.start_engine();
         }
+        if release {
+            self.release_output();
+        }
         if open_dialog {
             self.open_audio_dialog();
+        }
+    }
+
+    /// Faixa sob o topo quando um programa de transmissão, chamada ou gravação está aberto com a saída exclusiva:
+    /// ele não captura a guitarra e o som dele nessa saída fica mudo. Liberar passa a saída para o compartilhado.
+    fn capture_banner(&mut self, ctx: &egui::Context, side: f32) {
+        let new = self.capture_apps.iter().any(|a| !self.capture_dismissed.contains(a));
+        // no --print aviso a lista vem de exemplo, sem motor
+        if !new || !(self.output_exclusive() || self.print.is_some()) {
+            return;
+        }
+        let one = self.capture_apps.len() == 1;
+        let names = join_names(&self.capture_apps.iter().map(|a| format!("o {a}")).collect::<Vec<_>>());
+        let text = format!(
+            "{}{} {}: com a saída exclusiva, {} o som do GuitarForge (transmissão e gravação saem sem a guitarra), e o som {} \
+             nessa saída fica mudo.",
+            names[..1].to_uppercase(),
+            &names[1..],
+            if one { "está aberto" } else { "estão abertos" },
+            if one { "ele não captura" } else { "eles não capturam" },
+            if one { "dele" } else { "deles" },
+        );
+        let mut release = false;
+        let mut dismiss = false;
+        egui::TopBottomPanel::top("aviso_saida")
+            .frame(Frame::none().fill(theme::YELLOW.gamma_multiply(0.12)).inner_margin(Margin::symmetric(side, 7.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    widgets::led(ui, true, theme::YELLOW);
+                    let text_w = (ui.available_width() - 250.0).max(240.0);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(text_w);
+                        ui.add(Label::new(RichText::new(text).color(theme::TEXT)).wrap());
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        dismiss = ui.button("Agora não").on_hover_text("Esconde o aviso até outro programa desses abrir").clicked();
+                        release = ui.button("Liberar a saída").on_hover_text(RELEASE_HINT).clicked();
+                    });
+                });
+            });
+        if release {
+            self.release_output();
+        }
+        if dismiss {
+            self.capture_dismissed.extend(self.capture_apps.iter().copied());
         }
     }
 
@@ -951,6 +1201,26 @@ impl App {
                 if ui.add(button).on_hover_text(hint).clicked() {
                     g.on = !on;
                     g.hum_filter = !on;
+                }
+                let on = self.state.level_presets;
+                let trim = self.state.preset.settings.level_db;
+                let button = Button::new(RichText::new("Volume igual").color(if on { theme::GREEN } else { theme::DIM }))
+                    .fill(if on { theme::GREEN.gamma_multiply(0.12) } else { theme::CARD_OFF })
+                    .stroke(Stroke::new(1.0_f32, if on { theme::GREEN.gamma_multiply(0.7) } else { theme::FAINT }));
+                let hint = if on {
+                    format!(
+                        "Ligado: cada preset é medido ao carregar e todos saem no mesmo volume (neste, {} dB). \
+                         Mexer nos knobs depois muda o volume normalmente.",
+                        format!("{trim:+.1}").replace('.', ",")
+                    )
+                } else {
+                    "Desligado: cada preset sai no volume que os knobs dele dão.".to_string()
+                };
+                if ui.add(button).on_hover_text(hint).clicked() {
+                    self.state.level_presets = !on;
+                    self.level_current();
+                    self.baseline.level_db = self.state.preset.settings.level_db;
+                    self.dirty = true;
                 }
             });
         });
@@ -1274,6 +1544,9 @@ impl App {
     fn rack(&mut self, ui: &mut Ui) {
         let ir_name = self.ir.as_ref().map(|ir| ir.name.clone());
         let ir_error = self.ir_error.clone();
+        let room_name = self.room_ir.as_ref().map(|ir| ir.name.clone());
+        let room_error = self.room_error.clone();
+        let mut room_action = RoomAction::None;
         let gate_auto = Some(self.meters.gate_auto_db.get()).filter(|db| *db > -110.0);
         let s = &mut self.state.preset.settings;
         let total = ui.available_width();
@@ -1318,7 +1591,7 @@ impl App {
                         Post::Eq => eq_panel(ui, s, w),
                         Post::Delay => delay_panel(ui, s, w),
                         Post::Spread => spread_panel(ui, s, w),
-                        Post::Reverb => reverb_panel(ui, s, w),
+                        Post::Reverb => room_action = reverb_panel(ui, s, w, room_name.as_deref(), room_error.as_deref()),
                     }
                 }
             });
@@ -1329,6 +1602,11 @@ impl App {
             CabAction::Load => self.pick_ir(),
             CabAction::Remove => self.remove_ir(),
             CabAction::None => {}
+        }
+        match room_action {
+            RoomAction::Load => self.pick_room_ir(),
+            RoomAction::Remove => self.remove_room_ir(),
+            RoomAction::None => {}
         }
     }
 
@@ -1434,13 +1712,44 @@ impl App {
                             "O GuitarForge fica dono do cabo e lê blocos de 3 ms em vez de 10 ms. Sem efeito colateral: o cabo só serve a ele.",
                         );
                         ui.checkbox(&mut d.exclusive.output, "Saída").on_hover_text(
-                            "Uns 10 ms a menos, mas enquanto o GuitarForge estiver aberto os outros programas ficam sem som nessa saída. \
-                             Fone sem fio USB pode não aguentar: o app confere a taxa logo depois de abrir e, se o fone errar, volta sozinho \
-                             para o compartilhado.",
+                            "Uns 10 ms a menos, mas enquanto o GuitarForge estiver aberto nenhum outro programa toca nem captura \
+                             essa saída. Fone sem fio USB pode não aguentar: o app confere a taxa logo depois de abrir e, se o fone \
+                             errar, volta sozinho para o compartilhado.",
                         );
                     });
                     ui.end_row();
                 });
+
+                if d.exclusive.output {
+                    // a saída padrão é a de todos os programas (no JBL, a Game)
+                    let default = match &d.output {
+                        None => true,
+                        Some(n) => self.devices.default_output.as_deref() == Some(n.as_str()),
+                    };
+                    let head = if default {
+                        "Saída exclusiva na saída padrão do Windows: enquanto o GuitarForge estiver aberto, os outros programas \
+                         ficam sem som."
+                    } else {
+                        "Saída exclusiva: enquanto o GuitarForge estiver aberto, só ele toca nessa saída."
+                    };
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(500.0);
+                        ui.add(Label::new(RichText::new(head).color(theme::YELLOW)).wrap());
+                        ui.add(
+                            Label::new(
+                                RichText::new(
+                                    "Discord, OBS e o navegador não ouvem nem capturam o som dele: compartilhar a tela com \
+                                     som, transmitir ou gravar com outro programa sai sem a guitarra. Quem já estava tocando nessa \
+                                     saída pode ficar mudo até ser reaberto. Para transmitir ou gravar, deixe a saída compartilhada.",
+                                )
+                                .small()
+                                .color(theme::DIM),
+                            )
+                            .wrap(),
+                        );
+                    });
+                }
 
                 ui.add_space(6.0);
                 match &self.engine {
@@ -1506,6 +1815,19 @@ impl App {
     }
 }
 
+/// Explicação do "liberar" da saída exclusiva (no topo e no aviso de transmissão).
+const RELEASE_HINT: &str = "Passa a saída para o compartilhado: os outros programas voltam a tocar nela e a capturar o som \
+                            do GuitarForge. O atraso sobe uns 10 ms; para voltar ao exclusivo, Áudio….";
+
+/// "a", "a e b", "a, b e c".
+fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} e {last}", rest.join(", ")),
+    }
+}
+
 fn all_tunings() -> Vec<Tuning> {
     let mut list = tuner::builtin();
     list.extend(preset::custom_tunings());
@@ -1514,6 +1836,7 @@ fn all_tunings() -> Vec<Tuning> {
 
 fn same_sound(a: &Settings, b: &Settings) -> bool {
     let mut x = *a;
+    x.level_db = b.level_db;
     x.master = b.master;
     x.mute = b.mute;
     x.input_gain_db = b.input_gain_db;
@@ -2071,12 +2394,46 @@ fn spread_panel(ui: &mut Ui, s: &mut Settings, w: f32) {
     });
 }
 
-fn reverb_panel(ui: &mut Ui, s: &mut Settings, w: f32) {
+fn reverb_panel(ui: &mut Ui, s: &mut Settings, w: f32, room_name: Option<&str>, room_error: Option<&str>) -> RoomAction {
+    let mut action = RoomAction::None;
     let r = &mut s.reverb;
     card(ui, "Reverb", "Ambiência de sala", theme::REVERB, &mut r.on, w, FX_BODY, |ui| {
+        let title = match (r.kind, room_name) {
+            (ReverbKind::File, Some(name)) => truncate(name, 22),
+            (ReverbKind::File, None) => "IR de sala (falta)".into(),
+            (k, _) => k.label().into(),
+        };
+        ComboBox::from_id_salt("sala").width(ui.available_width()).selected_text(title).show_ui(ui, |ui| {
+            ui.selectable_value(&mut r.kind, ReverbKind::Algorithm, "Algoritmo (leve)")
+                .on_hover_text("O reverb clássico de sempre: o knob Sala muda o tamanho.");
+            for k in ReverbKind::ROOMS {
+                let rt = room::shape(k).map_or(0.0, |s| s.rt60);
+                ui.selectable_value(&mut r.kind, k, format!("{} ({} s)", k.label(), format!("{rt:.1}").replace('.', ",")))
+                    .on_hover_text("Sala por convolução, gerada pelo app: o som some em tantos segundos.");
+            }
+            if let Some(name) = room_name {
+                ui.selectable_value(&mut r.kind, ReverbKind::File, format!("Arquivo: {}", truncate(name, 28)));
+            }
+            ui.separator();
+            if ui.button("Carregar IR de sala (.wav)…").on_hover_text("Resposta ao impulso de uma sala real, mono ou estéreo, até 8 s").clicked() {
+                action = RoomAction::Load;
+            }
+            if room_name.is_some() && ui.button("Remover o IR de sala").clicked() {
+                action = RoomAction::Remove;
+            }
+        });
+        if let Some(e) = room_error {
+            ui.label(RichText::new(truncate(e, 30)).small().color(theme::RED)).on_hover_text(e);
+        }
         even_row(ui, 2, KNOB_W, |ui| {
-            ui.add(Knob::new(&mut r.size, "Sala").accent(theme::REVERB));
+            if r.kind.is_convolution() {
+                ui.add(Knob::new(&mut r.pre_delay_ms, "Pré-atraso").range(0.0, 150.0, 0.0).step(1.0).format(fmt_ms).accent(theme::REVERB))
+                    .on_hover_text("Espera antes da sala responder: separa a nota do eco e deixa o som mais nítido.");
+            } else {
+                ui.add(Knob::new(&mut r.size, "Sala").accent(theme::REVERB));
+            }
             ui.add(Knob::new(&mut r.mix, "Mix").default_value(0.2).accent(theme::REVERB));
         });
     });
+    action
 }

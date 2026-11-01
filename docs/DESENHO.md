@@ -29,7 +29,7 @@ Interface amigável pronta e testada com o cabo real. A fase "personalizável" f
   cabo, mono).
 - IRs carregados: cópia em `%APPDATA%\GuitarForge\irs\` (nome do arquivo e impressão digital do conteúdo); o preset
   guarda o nome da cópia (`ir_file`) e o caminho original só como informação.
-- Testes: `cargo test` (54: DSP, afinador, detecção de corda e de harmônico, gate automático com o ruído real
+- Testes: `cargo test` (63: DSP, sala por convolução, volume dos presets, afinador, detecção de corda e de harmônico, gate automático com o ruído real
   do cabo, filtro de zumbido, motor de áudio, presets, trocas sem estalo e o teclado/roda do knob simulados no egui
   sem janela). Medidas de custo, ignoradas por padrão: `cargo test --release -- --ignored --nocapture custo`.
 - Afinações do usuário: `%APPDATA%\GuitarForge\afinacoes.json`.
@@ -67,8 +67,11 @@ Guitarra > cabo Rocksmith (WASAPI exclusivo: 1 canal, 48 kHz, 16 bits, blocos de
   ===== daqui em diante, estéreo =====
   > Estéreo (dobra: cópia de 15 ms balançando 1,5 ms a 0,23 Hz, somada num lado e subtraída no outro, passa-altas de
             130 Hz na cópia; a soma dos lados é o som original, então mono não muda; largura de 0 a 1)
-  > Reverb (Freeverb estéreo: 8 combs e 4 all-pass por lado, o direito 23 amostras mais longo)
-  > Volume e limitador suave (linear até 0,7, encosta em 1,0), nos dois lados
+  > Reverb, dois motores com transição de 30 ms entre eles: algoritmo (Freeverb estéreo: 8 combs e 4 all-pass por
+    lado, o direito 23 amostras mais longo) ou sala por convolução (IR estéreo de até 8 s, de fábrica ou de arquivo,
+    com pré-atraso de até 150 ms; ver "Sala por convolução" abaixo)
+  > Compensação do preset (volume igual entre presets), volume e limitador suave (linear até 0,7, encosta em 1,0),
+    nos dois lados
   > Saída padrão do Windows, compartilhada ou exclusiva (esquerda e direita; o resto mudo em 5.1/7.1; saída mono
     recebe a média)
 Em paralelo: afinador (YIN sobre o sinal sem zumbido), nível, ruído de fundo (mínimo de 5 s) e zumbido da rede
@@ -84,6 +87,36 @@ Em paralelo: afinador (YIN sobre o sinal sem zumbido), nível, ruído de fundo (
   por um silêncio curto: o som abaixa em 5 ms **antes do delay e do reverb**, a troca entra no silêncio e volta em
   5 ms. O rabo do eco e da sala continua soando. A interface diz que é troca de preset (`send_settings(s, true)`).
 - Com isso, as nove trocas do teste (pedais, canal, preset) saltam no máximo 1,0 vez o normal.
+
+**Sala por convolução (01/11, `src/dsp/room.rs`)**: o IR longo é dividido em três camadas de partições uniformes,
+de 64, 512 e 4096 amostras. A cabeça (0 a 960) é calculada inteira a cada 64 amostras e dá o atraso da sala: 64
+amostras, como o IR de gabinete. Uma camada de bloco B começa no IR em 2B - 64: o bloco de entrada dela fica pronto, a
+soma das partições é espalhada pelos B/64 blocos de 64 seguintes e o resultado sai no período depois desse, alinhado
+com a cabeça. Num bloco só ficam juntas apenas as FFTs de fim de período (8192 pontos na cauda, a cada 85 ms). A
+entrada é a soma dos dois lados; o IR é estéreo, e um arquivo mono vale para os dois lados.
+- Salas de fábrica geradas pelo app, sem arquivo de terceiros: Quarto (0,4 s), Estúdio (0,7), Sala (1,2), Salão (2,2)
+  e Igreja (3,8). Cada lado é um ruído com sorteio próprio (os lados não se parecem: som em volta), envelope que sobe
+  durante as primeiras reflexões e cai 60 dB no tempo da sala, um passa-baixas que escurece com o tempo (o agudo morre
+  antes) e passa-altas de 120 Hz (sem grave embolado). Energia média 1 por lado; `ROOM_WET` deixa a sala no nível do
+  algoritmo com o mesmo Mix (de -1,9 a +1,5 dB, teste `room_and_algorithm_have_the_same_level`).
+- IR de arquivo: WAV mono ou estéreo, cortado em 8 s, cópia na pasta de IRs como o de gabinete, guardado no preset
+  (`room_ir_file`). Faltando a cópia, a sala cala e o cartão avisa.
+- A interface monta a sala (5 a 30 ms) e manda pronta por canal; o reverb faz 50 ms de transição com a anterior, que
+  volta por outro canal para ser liberada fora do áudio. Voltar ao algoritmo manda "nenhuma sala" e a antiga sai em
+  transição.
+- Custo medido (`custo_da_sala`, blocos de 3 ms): algoritmo 0,13% de um núcleo; Quarto 0,29%, Sala 0,34%, Igreja
+  0,49%, arquivo de 8 s 0,79%; pior bloco 0,19 ms.
+
+**Volume igual entre presets (01/11, `src/dsp/loudness.rs`)**: ao carregar um preset (de fábrica ou do usuário) a
+interface passa por ele, fora do áudio, um acorde de referência (Mi maior aberto, 4 batidas, no nível do DI real do
+cabo) e mede o volume percebido com o filtro K da BS.1770 (o do LUFS), em blocos de 400 ms com porta de -10 dB, e com
+o volume em 0,5 para o limitador não entrar na conta (uns 20 ms). A diferença para o alvo (o do "Limpo cristalino",
+-11,5 dB com o volume no máximo; até ±24 dB) vira `level_db`, aplicado junto do volume geral. Mexer nos knobs depois
+muda o volume normalmente; o botão "Volume igual" (ligado por padrão, guardado no estado) desliga. Antes, com a mesma
+força na corda, os presets de fábrica iam de -29 dB (Funk com wah) a -3 dB (Solo com delay e Psicodélico); o Direto
+saía 13 dB abaixo do Limpo cristalino (12 dB na gravação de 01/11). Os canais do amp também pulavam 12 dB do Limpo ao
+Lead; o ganho final de cada canal foi acertado (Limpo 3,3, Crunch 1,0, Lead 0,43, depois da saturação, sem mudar o
+timbre) e os três ficam a 0,1 dB um do outro com os knobs no padrão (teste `amp_channels_sound_equally_loud`).
 
 **Denormais (01/11)**: quando o gate fecha, os filtros, o gate e o reverb decaem até números abaixo de 1e-38, que o
 processador calcula devagar: o silêncio depois de uma nota custava 40 a 55% a mais que tocar (teste ignorado
@@ -175,6 +208,28 @@ Decisões tiradas de teste no aparelho:
 - Exclusivo **toma** o dispositivo de quem o usa no compartilhado (padrão do Windows "dar prioridade a aplicativos no
   modo exclusivo"): o outro programa perde o áudio até reabrir.
 
+**Ninguém captura a saída exclusiva (01/11, achado ao transmitir o app numa chamada pelo navegador)**: o som
+exclusivo vai direto ao driver, por fora do mixer do Windows, e toda captura do "som do PC" lê do mixer: o Áudio do
+desktop e a Captura de áudio de aplicativo do OBS, compartilhar a tela com som no Chrome, o Discord. Medido com um
+programa de teste que toca um Lá de 440 Hz (-12 dBFS de pico) no Steam Streaming Speakers e captura ao mesmo tempo:
+
+| som | captura do dispositivo (Áudio do desktop) | captura por aplicativo |
+|---|---|---|
+| compartilhado | -15,1 dBFS de RMS, o tom inteiro | -15,1 dBFS, o tom inteiro |
+| exclusivo, captura aberta depois | não abre (`AUDCLNT_E_DEVICE_IN_USE`) | abre e só pega zeros |
+| exclusivo, captura já aberta antes | morre quando o exclusivo abre (`AUDCLNT_E_DEVICE_INVALIDATED`) | só zeros |
+
+No JBL Game, com o GuitarForge aberto e a saída exclusiva nele, a captura do dispositivo também não abre. Não é
+defeito do site nem do Chrome (que entrega um tom de 440 Hz no lugar do som do sistema): uma live no OBS teria o
+mesmo problema. Se uma transmissão deu certo antes, a saída estava compartilhada (a exclusiva existe desde a v0.3,
+e o JBL às vezes caía sozinho no compartilhado). Quem já tocava na saída fica mudo: o AudioContext do Chrome para e não
+volta sozinho. Por isso, no app: aviso no diálogo Áudio… ao marcar a saída exclusiva (mais forte quando é a saída
+padrão do Windows), "saída exclusiva" e o botão "liberar" no topo, e uma faixa de aviso com "Liberar a saída" quando
+OBS, Streamlabs, XSplit, Discord, Teams, Zoom ou Audacity estão abertos (`src/audio/capture_apps.rs`: foto da lista
+de processos a cada 5 s, só com a saída exclusiva; "Agora não" esconde até outro desses abrir). O navegador não entra
+na procura: está sempre aberto e não dá para saber de fora se ele está transmitindo. `--print f.bmp 1220 860 aviso`
+mostra a faixa e `... audio` o diálogo, para conferir o layout.
+
 Atraso do app medido com `--teste-motor 10` (cabo > JBL, motor mudo; o compartilhado ainda soma o mixer do Windows,
 uns 10 a 20 ms, e o rádio do fone sem fio soma o dele nos dois casos):
 
@@ -253,12 +308,22 @@ Latência Baixa e Normal pedem período de 3 ms; Segura pede 10 ms. A folga do a
 - [x] Trocas sem estalo: pedais com transição de 10 ms, canal, drive, gabinete, IR e preset por um silêncio curto (01/11)
 - [x] IR guardado com o preset (cópia na pasta do app) (01/11)
 - [x] Saída estéreo: Estéreo (dobra, mono compatível) e reverb estéreo; gravação processada em estéreo (01/11)
-- [ ] IR longa (sala, reverb por convolução) em partições de tamanhos diferentes
-- [ ] Nivelar o volume entre presets e canais
-- [ ] Looper, metrônomo, backing track
+- [x] IR longa (sala, reverb por convolução) em partições de tamanhos diferentes (01/11): cinco salas de fábrica e IR
+  de arquivo, pré-atraso, menos de 1% de um núcleo
+- [x] Nivelar o volume entre presets e canais (01/11): medida BS.1770 de cada preset ao carregar, canais do amp acertados
+- [ ] Cópia para transmissão: com a saída exclusiva no fone (atraso baixo), mandar uma cópia compartilhada para outro
+  dispositivo (um cabo virtual) que o OBS ou o navegador capturem. Hoje transmitir pede a saída compartilhada (01/11)
+- [ ] Looper, metrônomo, backing track (a música tocada dentro do app: com a saída exclusiva o Windows cala o resto,
+  e é o que os pedais com Bluetooth fazem)
 - [ ] Do fone (barato ao caro): aviso de que fone sem fio soma atraso (e a dica do cabo de 3,5 mm e da Chat como
   mixer); medir o atraso real até o ouvido com a concha do fone encostada no captador (o single coil pega o campo do
-  alto-falante); amp "na sala" pelos canais 7.1 da Game e o head tracking do JBL (só no compartilhado, +20 ms).
+  alto-falante) ou com o microfone de calibração do JBL; amp "na sala" pelos canais 7.1 da Game e o head tracking do
+  JBL (só no compartilhado, +20 ms). Prioridade baixa: em 01/11, fone com fio direto num pedal (atraso perto de zero)
+  contra o app de sempre (uns 14 ms mais o rádio do JBL), quem toca não sentiu diferença.
+- [ ] Pedal multiefeitos como placa de som (Cuvave Cube Baby, medido em 01/11): entrada mono 48 kHz 16 bits (igual ao
+  cabo) com o som já processado, tirado antes do knob de volume (pedal sem efeito = sinal limpo); a captura chegou
+  uns 10 a 15 ms antes da do cabo Rocksmith (a confirmar no exclusivo). Ele mistura de volta na entrada o som que o
+  PC toca nele, então não serve de entrada e saída ao mesmo tempo (microfonia). Os botões não mandam MIDI.
 
 ## Diferenciais vs concorrência
 

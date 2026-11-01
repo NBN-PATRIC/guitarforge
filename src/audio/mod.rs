@@ -1,3 +1,4 @@
+pub mod capture_apps;
 pub mod diagnostic;
 pub mod recorder;
 #[cfg(windows)]
@@ -14,6 +15,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::dsp::SignalChain;
 use crate::dsp::cabinet::Convolver;
+use crate::dsp::room::RoomConvolver;
 use crate::meters::Meters;
 use crate::preset::{Exclusive, LatencyMode, Oversample};
 use crate::settings::Settings;
@@ -21,6 +23,8 @@ use crate::settings::Settings;
 pub struct Devices {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    /// A saída padrão do Windows, a que todos os programas usam (a saída exclusiva nela cala o PC inteiro).
+    pub default_output: Option<String>,
 }
 
 /// Dispositivos de um lado. O `input_devices` e o `output_devices` do cpal testam formato por formato de cada
@@ -35,7 +39,11 @@ fn devices_of(host: &cpal::Host, input: bool) -> Vec<cpal::Device> {
 pub fn list_devices() -> Devices {
     let host = cpal::default_host();
     let names = |list: Vec<cpal::Device>| -> Vec<String> { list.iter().filter_map(|d| d.name().ok()).collect() };
-    Devices { inputs: names(devices_of(&host, true)), outputs: names(devices_of(&host, false)) }
+    Devices {
+        inputs: names(devices_of(&host, true)),
+        outputs: names(devices_of(&host, false)),
+        default_output: host.default_output_device().and_then(|d| d.name().ok()),
+    }
 }
 
 /// `--teste-motor`: liga o motor mudo (nada chega ao fone) e mede blocos, fila, atraso e falhas.
@@ -172,6 +180,8 @@ pub struct Engine {
     settings_tx: Sender<(Settings, bool)>,
     ir_tx: Sender<Option<Box<Convolver>>>,
     trash_rx: Receiver<Box<Convolver>>,
+    room_tx: Sender<Option<Box<RoomConvolver>>>,
+    room_trash_rx: Receiver<Box<RoomConvolver>>,
     rec_rx: Option<rtrb::Consumer<f32>>,
     tap_rx: Option<rtrb::Consumer<f32>>,
 }
@@ -231,6 +241,8 @@ impl Engine {
         let (settings_tx, settings_rx) = crossbeam_channel::bounded(64);
         let (ir_tx, ir_rx) = crossbeam_channel::bounded(4);
         let (trash_tx, trash_rx) = crossbeam_channel::bounded(4);
+        let (room_tx, room_rx) = crossbeam_channel::bounded(4);
+        let (room_trash_tx, room_trash_rx) = crossbeam_channel::bounded(8);
         // os dois lados intercalados: meio segundo de som
         let (out_prod, out_cons) = rtrb::RingBuffer::new(rate as usize);
         let (an_prod, an_cons) = rtrb::RingBuffer::new(rate as usize / 2);
@@ -245,6 +257,8 @@ impl Engine {
             settings_rx,
             ir_rx,
             trash_tx,
+            room_rx,
+            room_trash_tx,
             out: out_prod,
             analysis: an_prod,
             rec: rec_prod,
@@ -313,6 +327,8 @@ impl Engine {
             settings_tx,
             ir_tx,
             trash_rx,
+            room_tx,
+            room_trash_rx,
             rec_rx: Some(rec_cons),
             tap_rx: Some(tap_cons),
         })
@@ -327,9 +343,15 @@ impl Engine {
         let _ = self.ir_tx.try_send(conv);
     }
 
+    /// Sala por convolução nova (ou `None` para o reverb por algoritmo). Monte com `dsp::room::build`.
+    pub fn send_room(&self, room: Option<Box<RoomConvolver>>) {
+        let _ = self.room_tx.try_send(room);
+    }
+
     /// Convolvers trocados voltam da thread de áudio para serem liberados aqui.
     pub fn collect_trash(&self) {
         while self.trash_rx.try_recv().is_ok() {}
+        while self.room_trash_rx.try_recv().is_ok() {}
     }
 
     pub fn take_recorder_input(&mut self) -> Option<rtrb::Consumer<f32>> {
@@ -437,6 +459,8 @@ struct InputSide {
     settings_rx: Receiver<(Settings, bool)>,
     ir_rx: Receiver<Option<Box<Convolver>>>,
     trash_tx: Sender<Box<Convolver>>,
+    room_rx: Receiver<Option<Box<RoomConvolver>>>,
+    room_trash_tx: Sender<Box<RoomConvolver>>,
     out: rtrb::Producer<f32>,
     analysis: rtrb::Producer<f32>,
     rec: rtrb::Producer<f32>,
@@ -474,6 +498,12 @@ impl InputSide {
         {
             self.chain.queue_ir(conv);
         }
+        // a sala troca com transição dentro do reverb; a que sai volta para ser liberada fora do áudio
+        while let Ok(room) = self.room_rx.try_recv() {
+            if let Some(old) = self.chain.swap_room(room) {
+                let _ = self.room_trash_tx.try_send(old);
+            }
+        }
 
         self.mono.clear();
         let mut peak = 0.0f32;
@@ -503,6 +533,9 @@ impl InputSide {
         self.chain.process_stereo(&mut self.mono, &mut self.right);
         if let Some(old) = self.chain.take_old_ir() {
             let _ = self.trash_tx.try_send(old);
+        }
+        if let Some(old) = self.chain.take_retired_room() {
+            let _ = self.room_trash_tx.try_send(old);
         }
         self.meters.gate_auto_db.set(self.chain.auto_threshold_db.unwrap_or(-120.0));
         self.meters.gate_open.store(self.chain.gate_open(), Relaxed);

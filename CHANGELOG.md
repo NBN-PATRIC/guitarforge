@@ -1,5 +1,25 @@
 # Novidades
 
+## 0.5.0 (01/11/2026)
+
+- Reverb com sala por convolução: cinco salas de fábrica, geradas pelo próprio app (Quarto, Estúdio, Sala, Salão e
+  Igreja, de 0,4 a 3,8 segundos), ou o IR de uma sala real em WAV, mono ou estéreo, de até 8 segundos, guardado com o
+  preset como o IR de gabinete. Pré-atraso de até 150 ms. A sala acrescenta só 1,3 ms de atraso e gasta menos de 1% do
+  processador. Trocar de sala, ou voltar ao reverb de algoritmo, faz uma transição curta, sem cortar o rabo.
+- Volume igual entre presets: ao carregar um preset, o app mede o volume dele com um acorde de referência (do jeito que
+  o ouvido percebe, pela norma do LUFS) e compensa. Antes, com a mesma força na corda, os presets de fábrica variavam
+  até 26 dB e o Direto saía uns 13 dB abaixo do Limpo cristalino. Vale também para os presets do usuário; o botão
+  "Volume igual", ao lado da supressão de ruído, desliga.
+- Os canais Limpo, Crunch e Lead do amp saem no mesmo volume com os knobs no padrão (antes o Lead saía 12 dB acima
+  do Limpo).
+- Avisos da saída exclusiva. Com ela, o som do GuitarForge passa por fora do mixer do Windows: nenhum outro programa
+  consegue capturar (o OBS, o Discord, compartilhar a tela com som no navegador) e quem já tocava nessa saída pode
+  ficar mudo até ser reaberto. O diálogo Áudio… avisa ao marcar a saída exclusiva, com mais força quando ela é a saída
+  padrão do Windows; o topo mostra "saída exclusiva" com um link para liberar; e uma faixa avisa, com o botão
+  "Liberar a saída", quando OBS, Streamlabs, XSplit, Discord, Teams, Zoom ou Audacity estão abertos. Liberar passa a
+  saída para o modo compartilhado, que os outros programas capturam, com uns 10 ms a mais de atraso.
+- Correção: a bolha de status da barra de cima ficava uns 9 pixels abaixo dos botões ao lado.
+
 ## 0.4.0 (01/11/2026)
 
 - O som abre em menos de um segundo. Com alguns fones sem fio escolhidos como saída (medido num JBL Quantum910), cada
